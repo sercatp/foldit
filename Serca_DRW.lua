@@ -5,7 +5,7 @@
 [to ChatGPT:] you can add some major functions here too with their lines for better management
   Major functions:
     main() 
-      NextSelectionDynamic() ~1123
+      NextSelectionDynamic() ~1123 
 		ComputeDynamicRuleScores() ~1592
       ProcessSelectionEvent() ~ line 1366
         SortByBackbone() ~ line 2308
