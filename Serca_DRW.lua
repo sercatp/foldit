@@ -1,23 +1,53 @@
-
 --[[
+
+ChangeLog:
+    v2.2 - Major refactoring
+         - New selection picker for Rebuilds: 5 rules control segment priority for the next rebuild; Rule #6 lets you set per-segment rebuild priority manually.
+         - Reworked pre-Fuze ranking: randomly chooses one of three metrics to fuze the best ranked:
+            • Standard: score + subscores
+            • Draft: fast Fuze with Clashing Importance = 0.05
+            • Adaptive: based on subscores from successful rebuilds in current run
+         - Introduced new statistics system (just some vibecoding, sorry)
+         - Notes on segment 1 are now commands to control the script while it’s running.
+
+    v1.6 - Published recipe
+         - fix for prefuze ranking algorithm
+	v1.5 
+		- Added Remix. 'Remix instead of Rebuild' checkbox
+		- Added DRW with Cuts.
+	v1.3 - fixed the bug of not accepting the best score sometimes
+
+    The script is based on 'Remix Rebuild Selected' recipe
+
+--------------------------------------------------------------------
+
+Main settings:
+Start/End Length -- selection length for Rebuild
+
+These control the speed/quality balance:
+Fuze rndsNoGain -- how many iterations with no score increase the script waits before trying the fused model (higher = fewer fuses, less rigidity). At 10–20 fuses (F10–F20), the protein’s cooked.
+Shift rndsNoGain -- how many iterations with no score increase before the script reduces the rebuild length by 1.
+
+With cuts -- rebuild with cuts for the final-stage rebuilds
+
+
 
 
 [to ChatGPT:] please update the line numbers to the actual ones, if you add/remove a lot of code above these function
 [to ChatGPT:] you can add some major functions here too with their lines for better management
   Major functions:
-    main()
-      NextSelectionDynamic() ~1123
-		ComputeDynamicRuleScores() ~1592
-      ProcessSelectionEvent() ~ line 1366
-        SortByBackbone() ~ line 2308
-        RebuildToSlots() ~2510
+    main() 287
+      NextSelectionDynamic() 2045
+		ComputeDynamicRuleScores() 1324
+      ProcessSelectionEvent() 520
+        SortByBackbone() 750
+        RebuildToSlots() 934
         
-stats sections ~2736
-
+stats sections 2680
 ]]
-version = "2.1.52" -- [to GPT:] on every code modification increment the last number
+version = "2.1.74" -- [to GPT:] on every code modification increment the last number
 script_name = "Serca DRW "
-print (script_name..version) --skipped in v1.32
+print (script_name..version) 
 
 function ScoreReturn()
       x = current.GetEnergyScore()
@@ -33,6 +63,7 @@ proteinLength=structure.GetCount ()
 -- slot99 temporary slot for service needs
 -- slot98 used to store fuzed version of the highest score solution
 maxRebuildCount=96
+dialogSolutionsNum = 7
 sphereRadius=12
 reportLevel=2
 slotsToFuze=3
@@ -101,8 +132,8 @@ shiftFuze_counter = 0
 startingAA=1
 
 bestScore=ScoreReturn()
-lastScore=-999999
-currentBBScore=-999999
+lastScore=-9999999
+currentBBScore=-9999999
 rebuildScores = {}
 remixBBScores = {}, {}
 rebuildScores[1]=bestScore
@@ -135,11 +166,11 @@ fuzeConfig = {
 
 ------------------- Defaults to fill the dialog window rebuild parameters
 -- Baseline at 100 aa: how many no-gain events before fuze switch
-FUZE_BASE_100AA_NOCUTS   = 50   -- e.g., fuse every 120 Rebuilds on ProteinLength=100
-FUZE_BASE_100AA_WITHCUTS = 12    -- more aggressive when rebuilding with cuts
+FUZE_BASE_100AA_NOCUTS   = 30   -- e.g., fuse every 50 Rebuilds on ProteinLength=100
+FUZE_BASE_100AA_WITHCUTS = 6    -- more aggressive when rebuilding with cuts
 -- How often to shift length relative to fuze: shift threshold = fuze / SHIFT_PER_FUZE
 SHIFT_PER_FUZE_NOCUTS    = 2
-SHIFT_PER_FUZE_WITHCUTS  = 0.5
+SHIFT_PER_FUZE_WITHCUTS  = 0.45
 -- Dialog Slider ranges scale with baseline; cap to avoid runaway
 SLIDER_CAP_ABSOLUTE      = 2000
 FUZE_SLIDER_MAX_MULT     = 20
@@ -173,6 +204,9 @@ selectionStrategy = SELECTION_STRATEGY.DYNAMIC
 -- selection lengths around L (L−1, L, L+1) and pick the selection with the best average score. If two
 -- selections tie, we prefer the one closest to L, and if still equal, the shorter one.
 -- The tweakable constants below set how strong each rule is and how fast Rule 1 fades and Rule 3 grows.
+--  Rule 0 — Success-rate map: segments with higher success ratio (successes/attempts)
+--           get higher priority persistently.
+dyn_rule0_weight = 2.0   -- weight for Rule 0 (success ratio)
 dyn_rule1_weight = 1.0   -- weight for Rule 1 (aggregated impact of accepted rebuilds)
 dyn_rule2_weight = 1.0   -- age since last rebuild (in events)
 dyn_rule2_ageScale = 100 -- scale for typical age; used implicitly via min-max; keep for reference
@@ -181,22 +215,18 @@ dyn_rule4_weight = 0.3   -- low per-segment Score gets more points
 dyn_rule5_weight = 0.3   -- low per-segment ScoreBB gets more points
 -- Rule 6 — User map from Notes (base62 0-9,a-z,A-Z). Higher char → higher priority.
 dyn_rule6_weight = 2.0   -- default weight; can be changed via Notes
-rule6_mapNorm = rule6_mapNorm or {}  -- normalized [0..1] per-segment map (resampled to proteinLength)
 rule6_lastString = nil   -- last accepted raw base62 string from Notes
 rule6_mapNorm = {} -- Initialize Rule 6 normalized map with zeros (no effect) by default
 for i = 1, proteinLength do rule6_mapNorm[i] = 0 end
 
 -- Decaying aggregation for Rule 1 (success) and Rule 3 (no‑gain): always enabled.
-
--- Aggregation depth via half-life in events. H<=0 → lam=0 (memory of exactly last impulse).
-R1_DECAY_EVENTS = 6
-R3_DECAY_EVENTS = 6
-
 local function _agg_decay_from_half_life(H)
     if not H or H <= 0 then return 0 end
     return 2 ^ (-1 / H)
 end
-
+-- Aggregation depth via half-life in events. H<=0 → lam=0 (memory of exactly last impulse).
+R1_DECAY_EVENTS = 6
+R3_DECAY_EVENTS = 6
 dyn_rule1_agg_decay = _agg_decay_from_half_life(R1_DECAY_EVENTS)
 dyn_rule3_agg_decay = _agg_decay_from_half_life(R3_DECAY_EVENTS)
 
@@ -219,8 +249,8 @@ segScoreAtLastNoGain  = {}
 lastSuccessEventIndex = 0
 eventsProcessedCounter = 0
 consecutiveNoGainEvents = 0
--- Per-segment counter: how many times a segment was sent to rebuild (any event)
-segRebuildCount = {}
+ -- Per-segment counter: how many times a segment was sent to rebuild (any event)
+ segRebuildCount = {}
 -- Per-segment impact of the last accepted rebuild (absolute delta of per-segment score at success time)
 segImpactLastSuccess = {}
 -- Per-segment impact of the last unsuccessful rebuild attempt (absolute delta at failure time)
@@ -246,6 +276,8 @@ print ("+++Starting score "..startScore.." saved to slot 1")
 
 save.Quicksave(1)
 save.Quicksave(100)
+
+timer1, timer2, timer3, timer4, timer5  = 0,0,0,0,0 -- timers for srcipt functions to check execution. 
 
 selection.DeselectAll() --Clear All The Selections On The Start for DRW!
 save.SaveSecondaryStructure()
@@ -491,7 +523,7 @@ function ProcessSelectionEvent()
 
     solutionsFound = 1
     solutionSubscoresArray = {}
-    bestScore=-999999
+    bestScore=-9999999
     bestSlot=100 -- placeholder
     -- Reset candidate store to avoid carrying over tail from previous events
     rankScenario = nil
@@ -502,8 +534,8 @@ function ProcessSelectionEvent()
     SetSelection()
     -- Convert to Helices/Sheets to loop. This influences the rebuild solutions.
     -- Converting H/S to loop with probability p
-    local p = convertToLoopProb or 0
-    local forced = (p > 0) and (math.random() < p)
+    local p = convertToLoopProb
+    local forced = math.random() < p)
     local convHCnt, convECnt = 0, 0
     if forced or (p == 0 and convertLoop) then
       save.LoadSecondaryStructure()  -- restore original secondary structure только если будет конверсия
@@ -527,13 +559,15 @@ function ProcessSelectionEvent()
 
     if reportLevel>2 then print(remixNum, "solutions found on "..action..". Ranking best "..bestSelectNum) end
 
-    if Stats and Stats.enabled and remixNum and remixNum > 0 then
+    if Stats and Stats.enabled and remixNum > 0 then
+        local t0 = os.clock()
         local evIx = (eventsProcessedCounter or 0) + 1
         Stats.logCandidates(action, evIx, selectionStart, selectionEnd, startScore, remixBBScores)
         -- Check score dispersion
         if Stats.checkSubscoreVariability then
             pcall(Stats.checkSubscoreVariability, evIx, solutionSubscoresArray)
         end
+        timer4 = os.clock() - t0 + timer4
     end
 
     ----------------------------------- Short fuze
@@ -556,31 +590,34 @@ function ProcessSelectionEvent()
                         rec.draft_score = ScoreReturn()
                         rec.draft_bb    = ScoreBBReturn()
                       end
-                      if logStats then
-                          if Stats and Stats.enabled then
-                            local pre_s = rec.score
-                            local pre_bb = rec.scoreBB
-                            local subs_total_arr = nil
-                            for _, srec in ipairs(solutionSubscoresArray) do
-                                if srec["SolutionID"] == rec.id then
-                                    local parts = Stats.scoreParts or {}
-                                    subs_total_arr = {}
-                                    for idx, name in ipairs(parts) do subs_total_arr[idx] = srec[name] or 0 end
-                                    break
-                                end
-                            end
-                            local short_s = ScoreReturn(); local short_bb = ScoreBBReturn()
-                            Stats.logShortFuzeCand(action, (eventsProcessedCounter or 0)+1, selectionStart, selectionEnd,
-                              i, rec.id, short_s, short_bb, pre_s, subs_total_arr, (short_s - pre_s), pre_bb,
-                              rec.draft_score, rec.draft_bb, rec.rank_std or rec.rank)
-                            if i == 1 then
-                                preTopSlotId = rec.id
-                                Stats.logShortFuzeTop(action, (eventsProcessedCounter or 0)+1, selectionStart, selectionEnd, rec.id, rec.rank_std or rec.rank, short_s, short_bb)
-                            end
-                          end
-                      end
                     end
-                    
+
+                    if logStats then
+                        local t0 = os.clock()
+                        if Stats and Stats.enabled then
+                          local pre_s = rec.score
+                          local pre_bb = rec.scoreBB
+                          local subs_total_arr = nil
+                          for _, srec in ipairs(solutionSubscoresArray) do
+                              if srec["SolutionID"] == rec.id then
+                                  local parts = Stats.scoreParts or {}
+                                  subs_total_arr = {}
+                                  for idx, name in ipairs(parts) do subs_total_arr[idx] = srec[name] or 0 end
+                                  break
+                              end
+                          end
+                          local short_s = ScoreReturn(); local short_bb = ScoreBBReturn()
+                          Stats.logShortFuzeCand(action, (eventsProcessedCounter or 0)+1, selectionStart, selectionEnd,
+                            i, rec.id, short_s, short_bb, pre_s, subs_total_arr, (short_s - pre_s), pre_bb,
+                            rec.draft_score, rec.draft_bb, rec.rank_std or rec.rank)
+                          if i == 1 then
+                              preTopSlotId = rec.id
+                              Stats.logShortFuzeTop(action, (eventsProcessedCounter or 0)+1, selectionStart, selectionEnd, rec.id, rec.rank_std or rec.rank, short_s, short_bb)
+                          end
+                        end
+                        timer4 = os.clock() - t0 + timer4
+                    end
+
                     local textBest=""
                     if (ScoreReturn() > bestScore) then
                         save.Quicksave(99) --save to compare with the Final Fuze score
@@ -594,19 +631,24 @@ function ProcessSelectionEvent()
         end --local function RunShortFuseCandidates
 
         --------- Short fuze execution
-        
+        local t0 = os.clock()
         SortByBackbone()
+        timer1 = os.clock() - t0 + timer1
 
         if rankScenario == "draft" then
+            local t0 = os.clock()
             SortByBackbone(3) --no draft score yet, so solution list is not sorted. lets standard sort it for some aesthetics
+            timer1 = os.clock() - t0 + timer1
             if slotsToFuze == 1 then
 				if not rebuildWithCuts then
-					temp = math.tointeger(math.sqrt(remixNum)) --lets still fuze draft a few solutions
+					temp = math.floor(math.sqrt(remixNum)) --lets still fuze draft a few solutions
 					RunShortFuses(temp, 3, true, true, false) 
 				end
             else
                 RunShortFuses(remixNum, 3, false, true, true) --draft fuze all the candidates
+                local t0 = os.clock()
                 SortByBackbone(4) --sort by draft score
+                timer1 = os.clock() - t0 + timer1
                 rankScenario = "ShortFuzed"
                 RunShortFuses(bestSelectNum, 2, true, false, true)
             end
@@ -631,13 +673,18 @@ function ProcessSelectionEvent()
         eventDelta = currentScore - startScore
         -- success flag duplicates 'improved'; keep a single source of truth
         if  currentScore > startScore then -- accept Fuze results if the score is better for this selection
-            print ("Gained "..roundX(currentScore-startScore).." points. New best score: "..currentScore.." / "..bestScore)
-            if reportLevel>1  then print ("Total gain:", roundX(currentScore-initScore)) end
             -- Save current fused best/unfuzed best, then apply deferred ops uniformly to both slots
+            ReadNotes()
             save.Quicksave(98)
             save.Quickload(bestSlot)
+            ReadNotes()
             save.Quicksave(100)
-            startScore =  currentScore
+
+            -- Report gain using pre-update baseline (eventDelta), then update baseline
+            local prevBest = currentScore - eventDelta
+            print ("Gained "..roundX(eventDelta).." points. New best score: "..currentScore.." / "..ScoreReturn())
+            if reportLevel>1  then print ("Total gain:", roundX(currentScore-initScore)) end
+            startScore = currentScore
 
             -- Capture per-segment impact of this successful rebuild (Rule 1)
             UpdateImpactSuccess(segScoreBeforeEvent, selectionStart, selectionEnd)
@@ -663,6 +710,7 @@ function ProcessSelectionEvent()
         save.Quickload(100)
 
         if Stats and Stats.enabled then
+                local t0 = os.clock()
                 Stats.logFinalFuze(
                   action,
                   (eventsProcessedCounter or 0)+1,
@@ -689,6 +737,7 @@ function ProcessSelectionEvent()
                         end
                     end
                 end
+                timer4 = os.clock() - t0 + timer4
         end
 
         if slotsToFuze > 1 then print ("-------------------------------------------------") end
@@ -699,7 +748,6 @@ end
 --------------------------------------------------------------Rebuild/Remix--------------------------------------------------------------------
 
 function SortByBackbone(rankType)
-
   -- Helper: build and return a position->id map for current order
   local function posMap()
       local m = {}
@@ -708,8 +756,6 @@ function SortByBackbone(rankType)
   end
 
   N = #remixBBScores
-
-  -- Note: we'll compute 'standard' rank into rec.rank unconditionally below
 
   local function scoreRank(accumulate) 
       table.sort(remixBBScores, function(a,b) return (a.score or -1e18) > (b.score or -1e18) end)
@@ -774,32 +820,61 @@ function SortByBackbone(rankType)
       end
   end
 
- 
+  ------------------------------ranking starts here----------------------------------
   -- Default scenario: Choosing method to rank the Rebuild solutions
   if not rankType then
-    local evCur = (eventsProcessedCounter or 0) + 1
-    if syn_ramp_events > 0 then
-        wSyn = math.min(syn_alpha_max, syn_alpha_max * evCur / syn_ramp_events)
-    else
-        wSyn = syn_alpha_max
-    end
-    local total = math.max(0, current_rank_weight) + math.max(0, wSyn) + math.max(0, draft_rank_weight)
-    local r = (total > 0) and (math.random() * total) or 0
+        local evCur = (eventsProcessedCounter or 0) + 1
+        if syn_ramp_events > 0 then
+            wSyn = math.min(syn_alpha_max, syn_alpha_max * evCur / syn_ramp_events)
+        else
+            wSyn = syn_alpha_max
+        end
 
-    if r < math.max(0, current_rank_weight) then
-        rankType = 3
-        rankScenario = "standard"
-    elseif r < (math.max(0, current_rank_weight) + math.max(0, wSyn)) then
-        rankType = 5
-        rankScenario  = "dynamic" --syn sort
-    else
-        rankScenario = "draft"
-        rankType = 4
-    end
+        -- apply more draft weight to windows aligned with a hardness map (min-max scaled)
+        local wDraftEff = draft_rank_weight
+        draft_scale_source = "inefficiency"   -- "dispersion": Avg ScoreBB dispersion map; "inefficiency": Rank inefficiency map; "within_std": Per-seg BB std within window
+            local map = nil
+            if Stats then
+                if draft_scale_source == "inefficiency" and Stats._segmentRankInefficiencyMap then
+                    map = Stats._segmentRankInefficiencyMap()
+                elseif draft_scale_source == "dispersion" and Stats._segmentDispersionAveragesLenNorm then
+                    map = Stats._segmentDispersionAveragesLenNorm()
+                elseif draft_scale_source == "within_std" and Stats._segmentBBStdWithinLcorrMap then
+                    map = Stats._segmentBBStdWithinLcorrMap()
+                end
+            end
+            if map then
+                local sumSel, minAll, maxAll = 0, math.huge, -math.huge
+                for i = 1, proteinLength do
+                    local v = map[i] or 0
+                    if i >= selectionStart and i <= selectionEnd then sumSel = sumSel + v end
+                    if v > maxAll then maxAll = v end
+                    if v < minAll then minAll = v end
+                end
+                if maxAll > minAll then
+                    local avgSel = sumSel / math.max(1, (selectionEnd - selectionStart + 1))
+                    local draftScale = math.max(0.2, (avgSel - minAll) / (maxAll - minAll))
+                    wDraftEff = draft_rank_weight * draftScale
+                end
+            end
 
-    if reportLevel > 2 and slotsToFuze > 1 then
-        print(string.format("[Rank] scenario=%s (w: std=%.2f syn=%.2f draft=%.2f)", rankScenario, current_rank_weight, wSyn, draft_rank_weight))
-    end
+        local total = math.max(0, current_rank_weight) + math.max(0, wSyn) + math.max(0, wDraftEff)
+        local r = (total > 0) and (math.random() * total) or 0
+
+        if r < math.max(0, current_rank_weight) then
+            rankType = 3
+            rankScenario = "standard"
+        elseif r < (math.max(0, current_rank_weight) + math.max(0, wSyn)) then
+            rankType = 5
+            rankScenario  = "adaptive" --syn sort
+        else
+            rankScenario = "draft"
+            rankType = 4
+        end
+
+        if reportLevel > 2 and slotsToFuze > 1 then
+            print(string.format("[Rank] scenario=%s (w: std=%.2f syn=%.2f draft=%.2f)", rankScenario, current_rank_weight, wSyn, wDraftEff))
+        end
   end
 
   -- reset rank accumulator to avoid double-counting on repeated calls
@@ -825,6 +900,7 @@ function SortByBackbone(rankType)
       draftRank(false) 
       return posMap()
 
+  --Adaptive method calculations
   elseif rankType == 5 then
     local evCur = (eventsProcessedCounter or 0) + 1
     local usedSyn = false
@@ -877,8 +953,7 @@ function RebuildToSlots()
 			end
 		  end
 		end
-
-		if rebuildWithCuts then
+		if rebuildWithCuts then 
 		  if selectionStart > 1          then CutAndBand(selectionStart - 1, selectionStart - 1, selectionStart) end
 		  if selectionEnd   < proteinLength - 1 then CutAndBand(selectionEnd,         selectionEnd,     selectionEnd + 1) end
 		end
@@ -890,7 +965,9 @@ function RebuildToSlots()
 		end
 	  
 		-------REBUILD------
+        local t0 = os.clock()
 		structure.RebuildSelected(rebuildIter)
+        timer2 = os.clock() - t0 + timer2
 	  
 		if disableBandsOnRebuild then
 		  EnableBands(disabledBands)
@@ -1034,8 +1111,8 @@ function GetHighestSolutionIDs(solutionSubscoresArray)
   -- Iterate over each score part (skip the SolutionID field)
   for scorePart, _ in pairs(solutionSubscoresArray[1]) do
     if scorePart ~= "SolutionID" then
-      local maxSubscore = -999999
-      local minSubscore =  999999
+      local maxSubscore = -9999999
+      local minSubscore =  9999999
       local maxSolutionIDs = {}
       -- Iterate over each solution subscores
       for _, subscores in ipairs(solutionSubscoresArray) do
@@ -1072,8 +1149,6 @@ end
 
 local DIALOG_MODE = { NO_CUTS = "no_cuts", WITH_CUTS = "with_cuts" }
 local currentDialogMode = DIALOG_MODE.NO_CUTS
-
-local dialogSolutionsNum = 7
 
 local function applyDialogDefaults(mode)
     if mode == DIALOG_MODE.WITH_CUTS then
@@ -1247,7 +1322,8 @@ end
 --------------------------------------------------------------------------------- Rules ---------------------------------------------------------------------------------
 -- On-demand dynamic rule scoring (replicates the scoring used by NextSelectionDynamic)
 function ComputeDynamicRuleScores()
-    local r1Raw, r2Raw, r3Raw, r4Raw, r5Raw = {}, {}, {}, {}, {}
+    local r0Raw, r1Raw, r2Raw, r3Raw, r4Raw, r5Raw = {}, {}, {}, {}, {}, {}
+    local r0min, r0max = math.huge, -math.huge
     local r1min, r1max = math.huge, -math.huge
     local r2min, r2max = math.huge, -math.huge
     local r3min, r3max = math.huge, -math.huge
@@ -1261,6 +1337,12 @@ function ComputeDynamicRuleScores()
         local segBB    = GetSegmentBBScore(i)
         sMin = math.min(sMin, segScore); sMax = math.max(sMax, segScore)
         bbMin = math.min(bbMin, segBB);  bbMax = math.max(bbMax, segBB)
+
+        -- Rule 0 raw: success ratio per segment (successes / attempts), from Stats
+        local at = (Stats and Stats.segmentAttemptCount and Stats.segmentAttemptCount[i]) or 0
+        local sc = (Stats and Stats.segmentSuccessCount and Stats.segmentSuccessCount[i]) or 0
+        local r0 = (at > 0) and (sc / at) or 0
+        r0Raw[i] = r0; r0min = math.min(r0min, r0); r0max = math.max(r0max, r0)
 
         local d1 = (segImpactSuccAgg[i] or 0)
         r1Raw[i] = d1; r1min = math.min(r1min, d1); r1max = math.max(r1max, d1)
@@ -1294,8 +1376,9 @@ function ComputeDynamicRuleScores()
         return (val - vmin) / (vmax - vmin)
     end
 
-    local cont1, cont2, cont3, cont4, cont5, cont6, points = {}, {}, {}, {}, {}, {}, {}
+    local cont0, cont1, cont2, cont3, cont4, cont5, cont6, points = {}, {}, {}, {}, {}, {}, {}, {}
     for i = 1, proteinLength do
+        local r0 = dyn_rule0_weight * norm(r0Raw[i], r0min, r0max)
         local r1 = dyn_rule1_weight * norm(r1Raw[i], r1min, r1max)
         local r2 = dyn_rule2_weight * norm(r2Raw[i], r2min, r2max)
         local r3 = dyn_rule3_weight * norm(r3Raw[i], r3min, r3max)
@@ -1309,16 +1392,17 @@ function ComputeDynamicRuleScores()
         local r6 = 0
         if rule6_mapNorm then r6 = (rule6_mapNorm[i] or 0) * (dyn_rule6_weight or 0) end
 
-        cont1[i], cont2[i], cont3[i], cont4[i], cont5[i], cont6[i] = r1, r2, r3, r4, r5, r6
-        points[i] = (r1 + r2 + r3 + r4 + r5 + r6)
+        cont0[i], cont1[i], cont2[i], cont3[i], cont4[i], cont5[i], cont6[i] = r0, r1, r2, r3, r4, r5, r6
+        points[i] = (r0 + r1 + r2 + r3 + r4 + r5 + r6)
     end
 
-    return cont1, cont2, cont3, cont4, cont5, cont6, points
+    return cont1, cont2, cont3, cont4, cont5, cont6, cont0, points
 end
 
 -- Print the dynamic rule bars R1..R5 (+R6 if present), computed on-demand
-function PrintRuleBarsFrom(cont1, cont2, cont3, cont4, cont5, cont6)
+function PrintRuleBarsFrom(cont1, cont2, cont3, cont4, cont5, cont6, cont0)
     local pal = getBarPalette(BAR_STYLE.BASE10)
+    if cont0 then print("R0 "..encodeScalarArrayToBar(cont0, pal)) end
     print("R1 "..encodeScalarArrayToBar(cont1, pal))
     print("R2 "..encodeScalarArrayToBar(cont2, pal))
     print("R3 "..encodeScalarArrayToBar(cont3, pal))
@@ -1328,8 +1412,8 @@ function PrintRuleBarsFrom(cont1, cont2, cont3, cont4, cont5, cont6)
 end
 
 function PrintRuleBars()
-    local cont1, cont2, cont3, cont4, cont5, cont6 = ComputeDynamicRuleScores()
-    PrintRuleBarsFrom(cont1, cont2, cont3, cont4, cont5, cont6)
+    local cont1, cont2, cont3, cont4, cont5, cont6, cont0 = ComputeDynamicRuleScores()
+    PrintRuleBarsFrom(cont1, cont2, cont3, cont4, cont5, cont6, cont0)
 end
 
 -- Update per-segment impact arrays used by dynamic selection rules
@@ -1340,7 +1424,6 @@ function UpdateImpactSuccess(segScoreBeforeEvent, selStart, selEnd)
         local before = segScoreBeforeEvent[i] or after
         local delta = math.abs(after - before)
         local inside = (i >= (selStart or 1)) and (i <= (selEnd or 0))
-
         -- Legacy "last" snapshot for R1
         if inside then segImpactLastSuccess[i] = 0 else segImpactLastSuccess[i] = delta end
 
@@ -1486,114 +1569,100 @@ function ProcessNoteCommands(noteText)
     local lower = string.lower(text)
     local did = false
 
-    -- Robust first-pass: handle simple one-word commands line-by-line
-    -- Accept either separate lines ("unfreeze" on one line, "bands" on another)
-    -- or exact one-word lines. Fallback substring search (below) still handles
-    -- phrases like "please unfreeze" or "disable all bands please".
-    do
-        local unfreezeHit, unbandHit = false, false
-        local txt = text:gsub("\r\n", "\n")
-        for line in (txt.."\n"):gmatch("([^\n]*)\n") do
-            local l = string.lower((line or "")):gsub("^%s+", ""):gsub("%s+$", "")
-            if l == "unfreeze" then unfreezeHit = true end
-            if l == "band" or l == "bands" or l == "unband" or l == "disable band" or l == "disable bands" then
-                unbandHit = true
-            end
-        end
-        if unfreezeHit then
-            Deferred.unfreeze = true
-            print("[note] Unfreeze at round end")
-            did = true
-        end
-        if unbandHit then
-            Deferred.unband = true
-            print("[note] Disable bands at round end")
-            did = true
-        end
+    local function has(tok)
+        return string.find(lower, tok, 1, true) ~= nil
     end
 
-    -- Quick actions (deferred): record intent; apply later to slots 98/100
-    -- unfreeze → queue freeze.UnfreezeAll()
-    -- band     → queue band.DisableAll()
-    if not did then
-        if string.find(lower, "unfreeze", 1, true) then
-            Deferred.unfreeze = true
-            print("[note] Will unfreeze all segments at end of round.")
-            did = true
-        end
-        if string.find(lower, "band", 1, true) then
-            Deferred.unband = true
-            print("[note] Will disable all bands at end of round.")
-            did = true
-        end
+    -- Deferred quick actions
+    if has("unfreeze") or has("unfr") then
+        Deferred.unfreeze = true
+        print("[note] Unfreeze at round end")
+        did = true
+    end
+    if has("bands") or has("band") then
+        Deferred.unband = true
+        print("[note] Disable bands at round end")
+        did = true
     end
 
+    -- Rules bar
+    if has("rules") then
+        if PrintRuleBars then PrintRuleBars() end
+        did = true
+    end
 
-    -- Rule 6: user map and weight from Notes
-    -- Examples:
-    --   map 0Z
-    --   map 88888889999ca898... (base62 string). 
-    --   map 0Z w=1.5 - rebuilding the first half of the protein is low and the second half is high. String is normilized to protein length.
-    --   mapw 2.0   (set weight only)
-    --   r6w 1.2    (alias)
-    --   map clear  (reset to zeros)
+    -- Simple stats shortcuts
+    if has("maps") and Stats and Stats.printAllMaps then
+        Stats.printAllMaps()
+        did = true
+    end
+    if has("candidates") and Stats and Stats.printData then
+        Stats.printData("candidates")
+        did = true
+    end
+
+    -- Stats on/off
+    if has("disable") and Stats and Stats.setEnabled then
+        Stats.setEnabled(true)
+        did = true
+    end
+    if has("enable") and Stats and Stats.setEnabled then
+        Stats.setEnabled(false)
+        did = true
+    end
+
+    -- 'stat' == full analysis (equivalent to former 'stats all')
+    -- avoid triggering on 'stats on/off'
+    if has("stat") and Stats then
+        if Stats.printSummary then Stats.printSummary() end
+        if Stats.printAllCorrelations then Stats.printAllCorrelations() end
+        if Stats.printAllMaps then Stats.printAllMaps() end
+        did = true
+    end
+
+    -- Maps (Rule 6): clear and set string
+    if has("map clear") then
+        rule6_lastString = nil
+        rule6_mapNorm = {}
+        for i = 1, proteinLength do rule6_mapNorm[i] = 0 end
+        if PrintRule6Bar then PrintRule6Bar() end
+        did = true
+    end
     do
-        -- clear/reset
-        if string.find(lower, "map%s+clear") or string.find(lower, "map%s+reset") then
-            rule6_lastString = nil
-            rule6_mapNorm = {}
-            for i = 1, proteinLength do rule6_mapNorm[i] = 0 end
-            if reportLevel > 1 then print("Rebuild map cleared (all zeros).") end
-            PrintRule6Bar()
-            did = true
-        else
-            -- set map string
-            local mapStr = text:match("[Mm][Aa][Pp]%s+([0-9A-Za-z]+)")
+        -- find "map " position case-insensitively via 'lower', but capture from original 'text'
+        local sidx, eidx = lower:find("map%s+")
+        if sidx then
+            local rest = text:sub(eidx + 1)
+            local mapStr = rest:match("([0-9A-Za-z]+)")
             if mapStr and #mapStr > 0 then
-                UpdateRule6MapFromString(mapStr)
-                if reportLevel > 1 then
-                    print("Rule6 map set: len "..tostring(#mapStr).." → "..tostring(proteinLength))
-                end
-                -- optional inline weight: ... w=1.5 or weight=1.5
-                local wstr = text:match("[Ww][%s=]*([%d%.]+)") or text:match("[Ww][Ee][Ii][Gg][Hh][Tt]%s*=%s*([%d%.]+)")
-                local winline = tonumber(wstr or "")
-                if winline then
-                    dyn_rule6_weight = winline
-                    if reportLevel > 1 then print("Rebuild map weight set to", dyn_rule6_weight) end
-                end
-                PrintRule6Bar()
-                did = true
-            end
-            -- standalone weight setters
-            local w1 = text:match("[Mm][Aa][Pp][Ww]%s*=?%s*([%+%-%d%.]+)")
-            local w2 = text:match("[Rr]6[Ww]%s*=?%s*([%+%-%d%.]+)")
-            local wnum = tonumber(w1 or w2 or "")
-            if wnum then
-                dyn_rule6_weight = wnum
-                if reportLevel > 1 then print("Rebuild map weight set to", dyn_rule6_weight) end
-                PrintRule6Bar()
+                if UpdateRule6MapFromString then UpdateRule6MapFromString(mapStr) end
+                if PrintRule6Bar then PrintRule6Bar() end
                 did = true
             end
         end
     end
-
-    -- Rule weights (R1..R6): commands like "r1w -0.2", "r3w = 0.5"
-    do
-        local function set_rule_weight(idx, val)
-            if idx == 1 then dyn_rule1_weight = val
-            elseif idx == 2 then dyn_rule2_weight = val
-            elseif idx == 3 then dyn_rule3_weight = val
-            elseif idx == 4 then dyn_rule4_weight = val
-            elseif idx == 5 then dyn_rule5_weight = val
-            elseif idx == 6 then dyn_rule6_weight = val end
+    if has("mapw") then
+        local wnum = tonumber(lower:match("mapw%s*=?%s*([%+%-%d%.]+)") or "")
+        if wnum then
+            dyn_rule6_weight = wnum
+            if PrintRule6Bar then PrintRule6Bar() end
+            did = true
         end
-        for i=1,6 do
-            local pat = string.format("[Rr]%d[Ww]%%s*=?%%s*([%%+%%-%%d%%.]+)", i)
-            local valstr = text:match(pat)
-            if valstr then
-                local v = tonumber(valstr)
+    end
+
+    -- Rule weights r1w..r6w
+    do
+        for i = 1, 6 do
+            if has("r"..tostring(i).."w") then
+                local valstr = lower:match("r"..tostring(i).."w%s*=?%s*([%+%-%d%.]+)")
+                local v = tonumber(valstr or "")
                 if v then
-                    set_rule_weight(i, v)
+                    if i == 1 then dyn_rule1_weight = v
+                    elseif i == 2 then dyn_rule2_weight = v
+                    elseif i == 3 then dyn_rule3_weight = v
+                    elseif i == 4 then dyn_rule4_weight = v
+                    elseif i == 5 then dyn_rule5_weight = v
+                    else dyn_rule6_weight = v end
                     print(string.format("Rule R%d weight set to %s", i, tostring(v)))
                     did = true
                 end
@@ -1601,178 +1670,69 @@ function ProcessNoteCommands(noteText)
         end
     end
 
-    -- Aggregation controls: intentionally not exposed via Notes to keep UI simple.
-
-    -- Adjust fuzeAfternoGain and shiftNoGain thresholds via Notes
-    -- Examples:
-    --   fuze 12          or  fuzenogain 12
-    --   shift 5          or  shiftnogain 5
-    --   fuze=0 (switch every event), fuze=-1 (never auto-switch)
-    do
-        local function parseInt(patterns)
-            for _, pat in ipairs(patterns) do
-                local s = text:match(pat)
-                if s then
-                    local n = tonumber(s)
-                    if n then return n end
-                end
-            end
-            return nil
-        end
-
-        local newFuze = parseInt({
-            "[Ff][Uu][Zz][Ee]%s*=?%s*([+-]?%d+)",
-            "[Ff][Uu][Zz][Ee][Nn][Oo][Gg][Aa][Ii][Nn]%s*=?%s*([+-]?%d+)",
-            "[Ff][Uu][Zz][Ee]%s*[Nn][Oo][Gg][Aa][Ii][Nn]%s*=?%s*([+-]?%d+)",
-        })
-        if newFuze ~= nil then
-            fuzeAfternoGain = newFuze
-            if reportLevel > 1 then
-                print("Set fuzeAfternoGain =", fuzeAfternoGain, " (counter=", fuzeAfternoGain_counter or 0, ")")
-            end
-            did = true
-        end
-
-        local newShift = parseInt({
-            "[Ss][Hh][Ii][Ff][Tt]%s*=?%s*([+-]?%d+)",
-            "[Ss][Hh][Ii][Ff][Tt][Nn][Oo][Gg][Aa][Ii][Nn]%s*=?%s*([+-]?%d+)",
-            "[Ss][Hh][Ii][Ff][Tt]%s*[Nn][Oo][Gg][Aa][Ii][Nn]%s*=?%s*([+-]?%d+)",
-        })
-        if newShift ~= nil then
-            shiftNoGain = newShift
-            if reportLevel > 1 then
-                print("Set shiftNoGain =", shiftNoGain, " (counter=", shiftNoGain_counter or 0, ")")
-            end
-            did = true
-        end
-    end
-
-    -- Adjust StartRebuild / EndRebuild; clamp selectionLength; refresh static selections
-    -- Examples: start 12, startrebuild 12, end 6, endrebuild 6
-    do
-        local function parseInt(patterns)
-            for _, pat in ipairs(patterns) do
-                local s = text:match(pat)
-                if s then
-                    local n = tonumber(s)
-                    if n then return n end
-                end
-            end
-            return nil
-        end
-
-        local newStart = parseInt({
-            "[Ss][Tt][Aa][Rr][Tt]%s*=?%s*(%d+)",
-            "[Ss][Tt][Aa][Rr][Tt][Rr][Ee][Bb][Uu][Ii][Ll][Dd]%s*=?%s*(%d+)",
-        })
-        local newEnd = parseInt({
-            "[Ee][Nn][Dd]%s*=?%s*(%d+)",
-            "[Ee][Nn][Dd][Rr][Ee][Bb][Uu][Ii][Ll][Dd]%s*=?%s*(%d+)",
-        })
-
-        local changed = false
+    -- Start/End rebuild
+    local changedSE = false
+    if has("startrebuild") then
+        local s = lower:match("startrebuild%s*=?%s*(%d+)")
+        local newStart = tonumber(s or "")
         if newStart then
             if remixNotRebuild then
-                local cap = math.min(9, math.max(3, math.floor(newStart + 0)))
+                local cap = math.min(9, math.max(3, math.floor(newStart)))
                 if cap > proteinLength - 1 then cap = math.max(3, proteinLength - 1) end
                 StartRebuild = cap
             else
-                local cap = math.min(proteinLength, math.max(2, math.floor(newStart + 0)))
+                local cap = math.min(proteinLength, math.max(2, math.floor(newStart)))
                 StartRebuild = cap
             end
-            changed = true
+            changedSE = true
+            did = true
         end
+    end
+    if has("endrebuild") then
+        local s = lower:match("endrebuild%s*=?%s*(%d+)")
+        local newEnd = tonumber(s or "")
         if newEnd then
             if remixNotRebuild then
-                local cap = math.min(9, math.max(3, math.floor(newEnd + 0)))
+                local cap = math.min(9, math.max(3, math.floor(newEnd)))
                 if cap > proteinLength - 1 then cap = math.max(3, proteinLength - 1) end
                 EndRebuild = cap
             else
-                local cap = math.min(proteinLength, math.max(2, math.floor(newEnd + 0)))
+                local cap = math.min(proteinLength, math.max(2, math.floor(newEnd)))
                 EndRebuild = cap
             end
-            changed = true
+            changedSE = true
+            did = true
         end
-        if changed then
-            if StartRebuild < EndRebuild then
-                StartRebuild, EndRebuild = EndRebuild, StartRebuild
-            end
-            -- Clamp selectionLength into [EndRebuild .. StartRebuild]
-            if selectionLength < EndRebuild then selectionLength = EndRebuild end
-            if selectionLength > StartRebuild then selectionLength = StartRebuild end
-            if reportLevel > 1 then
-                print("Start/End updated:", StartRebuild, "/", EndRebuild, ", selectionLength=", selectionLength)
-            end
-            if selectionStrategy == SELECTION_STRATEGY.STATIC then
-                selNum = 0 -- force recompute of static selections on next loop
-            end
+    end
+    if changedSE then
+        if StartRebuild < EndRebuild then StartRebuild, EndRebuild = EndRebuild, StartRebuild end
+        if selectionLength < EndRebuild then selectionLength = EndRebuild end
+        if selectionLength > StartRebuild then selectionLength = StartRebuild end
+        if selectionStrategy == SELECTION_STRATEGY.STATIC then selNum = 0 end
+    end
+
+    -- fuze*/shift* thresholds
+    if has("fuze") then
+        -- accepts 'fuze', 'fuzenogain', 'fuze nogain', with optional '='
+        local n = tonumber(lower:match("fuze%w*%s*=?%s*([+-]?%d+)") or "")
+        if n ~= nil then
+            fuzeAfternoGain = n
+            did = true
+        end
+    end
+    if has("shift") then
+        -- accepts 'shift', 'shiftnogain', 'shift nogain', with optional '='
+        local n = tonumber(lower:match("shift%w*%s*=?%s*([+-]?%d+)") or "")
+        if n ~= nil then
+            shiftNoGain = n
             did = true
         end
     end
 
-    -- Stats controls via Notes (in-memory)
-    do
-        if Stats and (string.find(lower, "%f[%w]stats%f[%W]") or string.find(lower, "\nstats") or string.find(lower, "^stats")) then
-            -- on/off
-            if string.find(lower, "stats%s+on") then Stats.setEnabled(true); did = true end
-            if string.find(lower, "stats%s+off") then Stats.setEnabled(false); did = true end
-            -- clear
-            if string.find(lower, "stats%s+clear") then Stats.clear(); did = true end
-            -- summary
-            if string.find(lower, "stats%s+summary") or string.find(lower, "stats%s+sum") then Stats.printSummary(); did = true end
-            -- analyses: disabled individual triggers; use 'stats all' to run full set
-            -- show (kind, optional N)
-            local kind, n1, n2 = lower:match("stats%s+show%s+([a-z]+)%s+(%d+)")
-            if not kind then kind, n1 = lower:match("stats%s+show%s+([a-z]+)%s*$") end
-            if not kind then kind, n1 = lower:match("stats%s+([a-z]+)%s+(%d+)") end
-            if not kind then kind = lower:match("stats%s+([a-z]+)%s*$") end
-            if not kind then kind = lower:match("stats%s+show%s*$") and "summary" or nil end
-            local n = tonumber(n1 or n2 or "")
-            if kind == "summary" then Stats.printSummary(); did = true end
-            if kind == "candidates" or kind == "short" or kind == "final" then
-                Stats.printData(kind, n)
-                did = true
-            end
-            if kind == "segdisp" or kind == "segvar" or kind == "segdispersion" then
-                if Stats.printSegDispersion then Stats.printSegDispersion(n or 10) end
-                did = true
-            end
-            if kind == "maps" then
-                if Stats.printAllMaps then Stats.printAllMaps() end
-                did = true
-            end
-            if kind == "all" then
-                Stats.printSummary()
-                if Stats.printAllCorrelations then Stats.printAllCorrelations() end
-                if Stats.printAllMaps then Stats.printAllMaps() end
-                did = true
-            end
-        end
-    end
-
-    -- Quick shortcut: any note containing 'corr' runs all correlation analyses
-    -- This does not require 'stats' prefix and works regardless of Stats.enabled
-    if Stats and string.find(lower, "corr") then
-        if Stats.printAllCorrelations then Stats.printAllCorrelations() end
-        did = true
-    end
-
-    -- Shortcuts without 'stats': 'maps' prints all maps (word-boundary safe)
-    if string.find(lower, "%f[%w]maps%f[%W]") then
-        if Stats and Stats.printAllMaps then Stats.printAllMaps() end
-        did = true
-    end
-
-    -- Any phrase containing both "rebuild" and "event" triggers the events map
-    if string.find(lower, "rebuild") or string.find(lower, "event") then
-        PrintRebuildEventsPerSegment()
-        did = true
-    end
-
-    -- Keywords for R1..R5 bars: "rules", or "r1-r5", or presence of r1..r5
-    if string.find(lower, "rules") or string.find(lower, "r1%-?r6") or
-       (string.find(lower, "r1") and string.find(lower, "r2") and string.find(lower, "r3") and string.find(lower, "r4") and string.find(lower, "r5") and string.find(lower, "r6")) then
-        PrintRuleBars()
+    -- Timers summary
+    if has("time") then
+        print("--------------Timers--------------")
+        print ("Sorting "..roundX(timer1), "Subscoring "..roundX(timer5), "Rebuild "..roundX(timer2), "Fuze "..roundX(timer3), "Logging "..roundX(timer4))
         did = true
     end
 
@@ -2100,7 +2060,8 @@ function NextSelectionDynamic()
 
   ------RULES-------
   -- Collect raw components per segment
-  local r1Raw, r2Raw, r3Raw, r4Raw, r5Raw = {}, {}, {}, {}, {}
+  local r0Raw, r1Raw, r2Raw, r3Raw, r4Raw, r5Raw = {}, {}, {}, {}, {}, {}
+  local r0min, r0max = math.huge, -math.huge
   local r1min, r1max = math.huge, -math.huge
   local r2min, r2max = math.huge, -math.huge
   local r3min, r3max = math.huge, -math.huge
@@ -2114,6 +2075,12 @@ function NextSelectionDynamic()
       local segBB    = GetSegmentBBScore(i)
       sMin = math.min(sMin, segScore); sMax = math.max(sMax, segScore)
       bbMin = math.min(bbMin, segBB);  bbMax = math.max(bbMax, segBB)
+
+      -- Rule 0 raw: success ratio per segment (successes / attempts), from Stats
+      local at = (Stats and Stats.segmentAttemptCount and Stats.segmentAttemptCount[i]) or 0
+      local sc = (Stats and Stats.segmentSuccessCount and Stats.segmentSuccessCount[i]) or 0
+      local r0 = (at > 0) and (sc / at) or 0
+      r0Raw[i] = r0; r0min = math.min(r0min, r0); r0max = math.max(r0max, r0)
 
       local d1 = (segImpactSuccAgg[i] or 0)
       r1Raw[i] = d1; r1min = math.min(r1min, d1); r1max = math.max(r1max, d1)
@@ -2151,6 +2118,7 @@ function NextSelectionDynamic()
   local points = {}
   local cont1, cont2, cont3, cont4, cont5, cont6 = {}, {}, {}, {}, {}, {}
   for i = 1, proteinLength do
+      local r0 = dyn_rule0_weight * norm(r0Raw[i], r0min, r0max)
       local r1 = dyn_rule1_weight * norm(r1Raw[i], r1min, r1max)
       local r2 = dyn_rule2_weight * norm(r2Raw[i], r2min, r2max)
       local r3 = dyn_rule3_weight * norm(r3Raw[i], r3min, r3max)
@@ -2165,7 +2133,7 @@ function NextSelectionDynamic()
       if rule6_mapNorm then r6 = (rule6_mapNorm[i] or 0) * (dyn_rule6_weight or 0) end
 
       cont1[i], cont2[i], cont3[i], cont4[i], cont5[i], cont6[i] = r1, r2, r3, r4, r5, r6
-      points[i] = (r1 + r2 + r3 + r4 + r5 + r6)
+      points[i] = (r0 + r1 + r2 + r3 + r4 + r5 + r6)
   end
 
   -- Print selections
@@ -2602,6 +2570,7 @@ function parseInput(input)
 end
 -- Universal function that runs the logic on parsed input
 function Fuze2(inputString, slotx)
+    local t0 = os.clock()
 
 	recentbest.Save()
     local fuzeConfig = parseInput(inputString)
@@ -2625,6 +2594,7 @@ function Fuze2(inputString, slotx)
     ReadNotes()
 	recentbest.Restore()		
 
+    timer3 = os.clock() - t0 + timer3
   return score -- Return the score
 end
 
@@ -2703,6 +2673,7 @@ end
 
 -- Create array of the Scores for every Subscore of the puzzle
 function GetSolutionSubscores(SolutionID)
+    local t0 = os.clock()
     -- Reuse cached score part names when available to avoid repeated API calls
     local scoreParts = (Stats and Stats.scoreParts) or puzzle.GetPuzzleSubscoreNames() or {}
     if Stats and not Stats.scoreParts and #scoreParts > 0 then Stats.scoreParts = scoreParts end
@@ -2717,6 +2688,7 @@ function GetSolutionSubscores(SolutionID)
     end
 
     solutionSubscores["SolutionID"] = SolutionID
+    timer5 = os.clock() - t0 + timer5
     return solutionSubscores
 end
 
@@ -2726,7 +2698,7 @@ end
 
 ---------------------------------------------------- Stats --------------------------------------------------------------------
 Stats = Stats or {}
-Stats.enabled = true -- default ON per request
+Stats.enabled = true -- default ON 
 Stats._cleanup_ran = false
 Stats.candidates = Stats.candidates or {}
 Stats.short = Stats.short or {}
@@ -2739,42 +2711,47 @@ Stats.constSubscoreParts = Stats.constSubscoreParts or {}
 -- segment-level aggregates
 Stats.segmentAttemptCount = Stats.segmentAttemptCount or {}
 Stats.segmentSuccessCount = Stats.segmentSuccessCount or {}
-Stats.segmentVarSum = Stats.segmentVarSum or {}
-Stats.segmentVarCount = Stats.segmentVarCount or {}
 -- per-segment relative inefficiency counter: increment when short-fuse winner ≠ pre-rank #1
 Stats.segmentIneffCount = Stats.segmentIneffCount or {}
--- success delta distribution (edge vs interior)
-Stats.successEdgeDeltaSum = Stats.successEdgeDeltaSum or 0
-Stats.successEdgeCount    = Stats.successEdgeCount or 0
-Stats.successIntDeltaSum  = Stats.successIntDeltaSum or 0
-Stats.successIntCount     = Stats.successIntCount or 0
 Stats.maxRows = 5000 -- soft cap to avoid runaway memory; oldest trimmed
 
--- (moved) Ranking weights are configured near the top of the file
--- syn config is now read directly from user variables defined at the top
+-- lightweight version counters and caches for optimization
+Stats._candidatesVer = Stats._candidatesVer or 0
+Stats._shortVer = Stats._shortVer or 0
+Stats._cache = Stats._cache or { lenDisp = nil, segDispLN = nil, synByEvent = nil, synWeights = nil, winAgg = nil }
 
 function Stats._trim(tbl)
   local n = #tbl
   if n > Stats.maxRows then
     local drop = n - Stats.maxRows
-    for i=1,drop do tbl[i] = nil end
-    -- compact
-    local k=1; local out={}
-    for i=1,n do if tbl[i] ~= nil then out[k]=tbl[i]; k=k+1 end end
-    return out
+    local keep = n - drop
+    for i=1,keep do tbl[i] = tbl[i + drop] end
+    for i=keep+1,n do tbl[i] = nil end
   end
   return tbl
+end
+
+-- cache invalidators
+local function _invalidate_syn_caches()
+  if Stats and Stats._cache then
+    Stats._cache.synByEvent = nil
+    Stats._cache.synWeights = nil
+  end
+end
+local function _invalidate_dispersion_caches()
+  if Stats and Stats._cache then
+    Stats._cache.lenDisp = nil
+    Stats._cache.segDispLN = nil
+  end
 end
 function Stats.init()
   Stats.proteinLength = proteinLength
   -- capture references to existing dynamic-tracking arrays (for inspection)
   if segRebuildCount then Stats.segRebuildCount = segRebuildCount end
-  if segImpactLastSuccess then Stats.segImpactLastSuccess = segImpactLastSuccess end
-  if segImpactLastNoGain then Stats.segImpactLastNoGain = segImpactLastNoGain end
-  if segLastRebuildEventIx then Stats.segLastRebuildEventIx = segLastRebuildEventIx end
   -- capture subscore names once
   local ok, names = pcall(puzzle.GetPuzzleSubscoreNames)
   if ok and type(names)=="table" then Stats.scoreParts = names end
+  _invalidate_syn_caches(); _invalidate_dispersion_caches()
 end
 function Stats.setEnabled(on)
   Stats.enabled = (on and true) or false
@@ -2840,11 +2817,15 @@ local function _syn_event_scalar_stats(arr, field)
 end
 
 function Stats._syn_build_by_event()
+  -- cache by short-candidate version to avoid repeated regrouping
+  local c = Stats._cache and Stats._cache.synByEvent
+  if c and c.ver == Stats._shortVer and c.map then return c.map end
   local byEvent = {}
   for _,r in ipairs(Stats.shortCandidates or {}) do
     local t = byEvent[r.event_ix] or {}; byEvent[r.event_ix] = t
-    table.insert(t, r)
+    t[#t+1] = r
   end
+  if Stats and Stats._cache then Stats._cache.synByEvent = { ver = Stats._shortVer, map = byEvent } end
   return byEvent
 end
 
@@ -2853,6 +2834,14 @@ local _pearson
 
 function Stats.syn_compute_weights(limitEv)
   if not (Stats.scoreParts and #Stats.scoreParts>0) then return nil, 0, 0 end
+  -- cache lookup
+  do
+    local wc = Stats._cache and Stats._cache.synWeights
+    if wc and wc.ver == Stats._shortVer and wc.map and wc.map[limitEv] then
+      local hit = wc.map[limitEv]
+      return hit.w, hit.used, hit.eventsUsed
+    end
+  end
   local parts = Stats.scoreParts
   local np = #parts
   local xs, ys = {}, {}
@@ -2912,6 +2901,13 @@ function Stats.syn_compute_weights(limitEv)
     if rd ~= 0 and rd == rd then used = used + 1 end
     w._draft = rd or 0
   end
+  -- store in cache
+  do
+    local wc = Stats._cache and Stats._cache.synWeights
+    if not wc or wc.ver ~= Stats._shortVer then wc = { ver = Stats._shortVer, map = {} } end
+    wc.map[limitEv] = { w = w, used = used, eventsUsed = eventsUsed }
+    Stats._cache.synWeights = wc
+  end
   return w, used, eventsUsed
 end
 
@@ -2955,45 +2951,6 @@ local function _syn_rank_for_event(arr, weights)
   for i=1,#scored do order[i] = scored[i].slot end
   local top = scored[1] and scored[1].slot or nil
   return top, order
-end
-
--- Pure helper: return syn order and alpha without mutating inputs
-function Stats.syn_order_current_candidates(evCur, remixBBScores, solutionSubscoresArray)
-  if not (Stats and Stats.enabled) then return nil end
-  local parts = Stats.scoreParts
-  if not (parts and #parts > 0) then return nil end
-  if type(remixBBScores) ~= 'table' or #remixBBScores < 2 then return nil end
-
-  local wts, used, eventsUsed = Stats.syn_compute_weights(evCur)
-  if not (wts and used and used > 0 and eventsUsed and eventsUsed > 0) then return nil end
-
-  local frac = (syn_ramp_events and syn_ramp_events > 0) and (eventsUsed / syn_ramp_events) or 1
-  if frac < 0 then frac = 0 end; if frac > 1 then frac = 1 end
-  local alpha = (syn_alpha_max or 1.5) * frac
-  if alpha <= 0 then return nil end
-
-  local byId = {}
-  if type(solutionSubscoresArray)=="table" then
-    for _, rec in ipairs(solutionSubscoresArray) do
-      if type(rec)=="table" and rec["SolutionID"] then byId[rec["SolutionID"]] = rec end
-    end
-  end
-  local arrNow = {}
-  for _, r in ipairs(remixBBScores) do
-    local id = r.id
-    local subrec = byId[id]
-    local a = nil
-    if subrec then
-      a = {}
-      for idx, name in ipairs(parts) do a[idx] = subrec[name] or 0 end
-    end
-    arrNow[#arrNow+1] = {slot=id, subs_total=a, draft_score=r.draft_score}
-  end
-
-  local top, order = _syn_rank_for_event(arrNow, wts)
-  if not order or #order < 1 then return nil end
-
-  return { order = order, alpha = alpha, eventsUsed = eventsUsed }
 end
 
 -- Syn black-box: return order (slot ids, desc) and dynamic weight for blending
@@ -3040,6 +2997,31 @@ function Stats.Syn.order(evCur, remixBBScores, solutionSubscoresArray)
   return { order = order, weight = weight, eventsUsed = eventsUsed }
 end
 -- Print all available per-segment maps (normalized 0-9)
+-- Compute per-segment rank inefficiency: fraction of events where pre-rank #1
+-- did not win short-fuse (non-top1 short-win / attempts).
+function Stats._segmentRankInefficiencyMap()
+  local n = proteinLength or 0
+  local vals = {}
+  for i = 1, n do
+    local a = Stats.segmentAttemptCount[i] or 0
+    local b = Stats.segmentIneffCount[i] or 0
+    vals[i] = (a > 0) and (b / a) or 0
+  end
+  return vals
+end
+
+-- Per-segment BB std within window (mean-centered, L-corrected), aggregated across events
+function Stats._segmentBBStdWithinLcorrMap()
+  local n = proteinLength or 0
+  local vals = {}
+  for i = 1, n do
+    local s = (Stats.segmentBBVarSum and Stats.segmentBBVarSum[i]) or 0
+    local c = (Stats.segmentBBVarCount and Stats.segmentBBVarCount[i]) or 0
+    vals[i] = (c > 0 and s >= 0) and math.sqrt(s / c) or 0
+  end
+  return vals
+end
+
 function Stats.printAllMaps()
   if not (getBarPalette and encodeScalarArrayToBar) then return end
   local pal10 = getBarPalette(BAR_STYLE.BASE10)
@@ -3093,22 +3075,28 @@ function Stats.printAllMaps()
     end
   end
 
-  -- 5) Relative inefficiency map: fraction of events where pre-rank top1 did not win after short-fuse
+  -- 4b) Within-window per-segment BB std (mean-centered within each event window)
   do
     local n = proteinLength or 0
     local vals = {}
     local hasVal = false
     for i=1,n do
-      local a = Stats.segmentAttemptCount[i] or 0
-      local b = Stats.segmentIneffCount[i] or 0
-      if a > 0 then
-        vals[i] = b / a
-        if vals[i] ~= 0 then hasVal = true end
-      else
-        vals[i] = 0
-      end
+      local s = (Stats.segmentBBVarSum and Stats.segmentBBVarSum[i]) or 0
+      local c = (Stats.segmentBBVarCount and Stats.segmentBBVarCount[i]) or 0
+      local v = (c > 0 and s > 0) and math.sqrt(s / c) or 0
+      vals[i] = v
+      if v ~= 0 then hasVal = true end
     end
     if hasVal then
+      print("[Maps] Per-segment BB std within window (mean-centered, L-corrected):")
+      print(encodeScalarArrayToBar(vals, pal10))
+    end
+  end
+
+  -- 5) Relative inefficiency map: fraction of events where pre-rank top1 did not win after short-fuse
+  do
+    local vals = Stats._segmentRankInefficiencyMap and Stats._segmentRankInefficiencyMap() or {}
+    if hasData(vals) then
       print("[Maps] Rank inefficiency per segment (non-top1 short-win / attempts):")
       print(encodeScalarArrayToBar(vals, pal10))
     end
@@ -3117,18 +3105,17 @@ end
 
 -- Compute per-segment average dispersion (avg bb_std seen when segment was in a selection)
 function Stats._segmentDispersionAverages() -- legacy (unused for maps; kept for compatibility)
-  local n = proteinLength or 0
-  local avg = {}
-  for i=1,n do
-    local vSum = Stats.segmentVarSum[i] or 0
-    local vCnt = Stats.segmentVarCount[i] or 0
-    if vCnt > 0 then avg[i] = vSum / vCnt else avg[i] = 0 end
+  if Stats and Stats._segmentDispersionAveragesLenNorm then
+    return Stats._segmentDispersionAveragesLenNorm() or {}
   end
-  return avg
+  return {}
 end
 
 -- Build baseline bb_std statistics per window length from candidate events
 function Stats._lenDispersionStats()
+  -- memoize by candidates version
+  local c = Stats._cache and Stats._cache.lenDisp
+  if c and c.ver == Stats._candidatesVer then return c.mu, c.sd end
   local byLen = {}
   for _,row in ipairs(Stats.candidates or {}) do
     local L = tonumber(row.len or 0) or 0
@@ -3156,6 +3143,7 @@ function Stats._lenDispersionStats()
       sd[L] = (var > 0) and math.sqrt(var) or 0
     end
   end
+  if Stats and Stats._cache then Stats._cache.lenDisp = { ver = Stats._candidatesVer, mu = mu, sd = sd } end
   return mu, sd
 end
 
@@ -3178,6 +3166,9 @@ end
 -- Compute per-segment average of length-normalized dispersion.
 -- Normalization: ratio to mean bb_std for this window length (mu[L]).
 function Stats._segmentDispersionAveragesLenNorm()
+  -- memoize by candidates version
+  local c = Stats._cache and Stats._cache.segDispLN
+  if c and c.ver == Stats._candidatesVer and c.avg then return c.avg end
   local n = proteinLength or 0
   if n <= 0 then return {} end
   local mu, _ = Stats._lenDispersionStats()
@@ -3203,15 +3194,16 @@ function Stats._segmentDispersionAveragesLenNorm()
   for i=1,n do
     if (cnts[i] or 0) > 0 then avg[i] = (sums[i] or 0) / (cnts[i] or 1) else avg[i] = 0 end
   end
+  if Stats and Stats._cache then Stats._cache.segDispLN = { ver = Stats._candidatesVer, avg = avg } end
   return avg
 end
 
 -- Print per-segment dispersion map and top-K segments by average dispersion
 function Stats.printSegDispersion(topK)
-  local vals = Stats._segmentDispersionAverages()
+  local vals = (Stats._segmentDispersionAveragesLenNorm and Stats._segmentDispersionAveragesLenNorm()) or {}
   if getBarPalette and encodeScalarArrayToBar then
     local pal10 = getBarPalette(BAR_STYLE.BASE10)
-    print("[Stats] Segment avg bb_std (dispersion) map:")
+    print("[Stats] Segment avg bb_std (dispersion) map (len-normalized):")
     print(encodeScalarArrayToBar(vals, pal10))
   end
   -- collect top-K indices
@@ -3220,7 +3212,7 @@ function Stats.printSegDispersion(topK)
   table.sort(items, function(a,b) return (a.v or 0) > (b.v or 0) end)
   local K = tonumber(topK or 10) or 10
   if #items > 0 then
-    print(string.format("[Stats] Top %d segments by avg bb_std:", math.min(K, #items)))
+    print(string.format("[Stats] Top %d segments by avg bb_std (len-norm):", math.min(K, #items)))
     for j=1,math.min(K,#items) do
       print(string.format("  #%d  seg=%d  avg=%.3f", j, items[j].i or 0, items[j].v or 0))
     end
@@ -3232,12 +3224,14 @@ local function _win_agg(startIdx, endIdx)
   local s, bb, clash = 0, 0, 0
   local n = 0
   local ssH, ssE, ssL = 0,0,0
+  local bb_arr = {}
   for i = startIdx, endIdx do
     local si = current.GetSegmentEnergyScore(i)
-    local bbi = si - current.GetSegmentEnergySubscore(i, "Clashing")
     local ci = current.GetSegmentEnergySubscore(i, "Clashing")
+    local bbi = si - ci
     local ss = structure.GetSecondaryStructure(i)
     s = s + si; bb = bb + bbi; clash = clash + ci; n = n + 1
+    bb_arr[i] = bbi
     if ss == "H" then ssH = ssH + 1 elseif ss == "E" then ssE = ssE + 1 else ssL = ssL + 1 end
   end
   if n<1 then n=1 end
@@ -3247,6 +3241,7 @@ local function _win_agg(startIdx, endIdx)
     bb_mean = bb/n,
     clash_mean = clash/n,
     frac_H = ssH/n, frac_E = ssE/n, frac_L = ssL/n,
+    bb_arr = bb_arr,
   }
 end
 -- Amino-acid mapping and helpers
@@ -3399,7 +3394,32 @@ function Stats.logCandidates(action, eventIx, selStart, selEnd, startScore, remi
   end
   local sm, ssd = _mean_std(scores)
   local bm, bsd = _mean_std(bbs)
+  -- compute and cache per-event window aggregates to avoid repeat API calls
   local w = _win_agg(selStart, selEnd)
+  do
+    Stats._cache = Stats._cache or {}
+    Stats._cache.winAgg = Stats._cache.winAgg or {}
+    Stats._cache.winAgg[eventIx] = w
+  end
+  -- Accumulate per-segment within-window BB variance (centered at window mean) without extra API calls
+  do
+    local bb_arr = w.bb_arr or {}
+    local mean = w.bb_mean or 0
+    local L = tonumber(w.len or 0) or 0
+    local norm = 1.0
+    if L and L > 1 then
+      local f = 1 - (1 / L)
+      if f > 1e-9 then norm = math.sqrt(f) else norm = 1.0 end
+    end
+    Stats.segmentBBVarSum = Stats.segmentBBVarSum or {}
+    Stats.segmentBBVarCount = Stats.segmentBBVarCount or {}
+    for i = selStart, selEnd do
+      local di = (bb_arr[i] or 0) - mean
+      local din = (norm ~= 0) and (di / norm) or di
+      Stats.segmentBBVarSum[i] = (Stats.segmentBBVarSum[i] or 0) + din*din
+      Stats.segmentBBVarCount[i] = (Stats.segmentBBVarCount[i] or 0) + 1
+    end
+  end
   local r1,r2,r3,r4,r5,r6 = _rule_window_means(selStart, selEnd)
   -- segment-level aggregates for variability vs success later
   for i = selStart, selEnd do
@@ -3457,10 +3477,20 @@ function Stats.logCandidates(action, eventIx, selStart, selEnd, startScore, remi
   }
   table.insert(Stats.candidates, row)
   Stats.candidates = Stats._trim(Stats.candidates)
+  -- bump candidates version and invalidate related caches
+  Stats._candidatesVer = (Stats._candidatesVer or 0) + 1
+  _invalidate_dispersion_caches()
 end
 function Stats.logShortFuzeTop(action, eventIx, selStart, selEnd, slotId, rank, shortScore, shortBB)
   if not Stats.enabled then return end
-  local w = _win_agg(selStart, selEnd)
+  -- reuse cached window aggregates for this event when available
+  local w = (Stats._cache and Stats._cache.winAgg and Stats._cache.winAgg[eventIx])
+  if not w then
+    w = _win_agg(selStart, selEnd)
+    Stats._cache = Stats._cache or {}
+    Stats._cache.winAgg = Stats._cache.winAgg or {}
+    Stats._cache.winAgg[eventIx] = w
+  end
   local row = {
     event_ix = eventIx or 0, action = action or "",
     start = selStart or 0, finish = selEnd or 0, len = w.len or 0,
@@ -3489,6 +3519,9 @@ function Stats.logShortFuzeCand(action, eventIx, selStart, selEnd, preRank, slot
   if stdRankSum ~= nil then row.std_rank_sum = stdRankSum end
   table.insert(Stats.shortCandidates, row)
   Stats.shortCandidates = Stats._trim(Stats.shortCandidates)
+  -- bump short-candidate version and invalidate syn caches
+  Stats._shortVer = (Stats._shortVer or 0) + 1
+  _invalidate_syn_caches()
 end
 function Stats.logFinalFuze(action, eventIx, selStart, selEnd, bestSlot, shortBest, finalScore, success, conv_h, conv_e, conv_h_cnt, conv_e_cnt, event_delta)
   if not Stats.enabled then return end
@@ -3513,26 +3546,6 @@ function Stats.logSuccessWindow(selStart, selEnd, segBefore)
   for i = selStart, selEnd do
     Stats.segmentSuccessCount[i] = (Stats.segmentSuccessCount[i] or 0) + 1
   end
-  local len = (selEnd or 0) - (selStart or 0) + 1
-  if len < 1 then return end
-  local function deltaAt(i)
-    local after = current.GetSegmentEnergyScore(i)
-    local before = segBefore[i] or after
-    return math.abs(after - before)
-  end
-  -- edges
-  local de, ec = 0, 0
-  de = de + deltaAt(selStart); ec = ec + 1
-  if selEnd ~= selStart then de = de + deltaAt(selEnd); ec = ec + 1 end
-  Stats.successEdgeDeltaSum = (Stats.successEdgeDeltaSum or 0) + de
-  Stats.successEdgeCount    = (Stats.successEdgeCount or 0) + ec
-  -- interior
-  if len > 2 then
-    local di, ic = 0, 0
-    for i = selStart+1, selEnd-1 do di = di + deltaAt(i); ic = ic + 1 end
-    Stats.successIntDeltaSum = (Stats.successIntDeltaSum or 0) + di
-    Stats.successIntCount    = (Stats.successIntCount or 0) + ic
-  end
 end
 function Stats.clear()
   Stats.candidates = {}
@@ -3544,12 +3557,16 @@ function Stats.clear()
   -- reset per-segment aggregates
   Stats.segmentAttemptCount = {}
   Stats.segmentSuccessCount = {}
-  Stats.segmentVarSum = {}
-  Stats.segmentVarCount = {}
   Stats.segmentIneffCount = {}
+  Stats.segmentBBVarSum = {}
+  Stats.segmentBBVarCount = {}
   Stats.constSubscoreParts = {}
   -- reset AA cache (in case of reloads)
   Stats._aa3_cache = nil
+  -- reset versions and caches
+  Stats._candidatesVer = 0
+  Stats._shortVer = 0
+  Stats._cache = { lenDisp = nil, segDispLN = nil, synByEvent = nil, synWeights = nil, winAgg = nil }
   print("[Stats] cleared")
 end
 local function _printRows(rows, header, fields, limit)
@@ -3816,12 +3833,6 @@ function Stats.analyzeSS()
     corr(function(r) return r.frac_E end),
     corr(function(r) return r.frac_L end)))
 end
-function Stats.analyzePos()
-  local eCnt = Stats.successEdgeCount; local iCnt = Stats.successIntCount
-  local eAvg = (eCnt>0) and (Stats.successEdgeDeltaSum / eCnt) or 0
-  local iAvg = (iCnt>0) and (Stats.successIntDeltaSum / iCnt) or 0
-  print(string.format("[Stats] Success ΔScore: edge avg=%.3f (n=%d), interior avg=%.3f (n=%d)", eAvg, eCnt, iAvg, iCnt))
-end
 function Stats.analyzeVariability()
   local evSuc = _event_success_map(); local xs, ys = {}, {}
   for _,row in ipairs(Stats.candidates) do
@@ -3845,13 +3856,76 @@ function Stats.analyzeSegVarVsSuccess()
   if #xs==0 then print("[Stats] No segment data"); return end
   print(string.format("[Stats] Corr(len-norm bb_disp per seg, seg success rate) = %.3f", _pearson(xs, ys)))
 end
+
+-- Correlate within-window per-segment BB std (mean-centered) with segment success rate
+function Stats.analyzeSegVarWithinVsSuccess()
+  local xs, ys = {}, {}
+  local n = Stats.proteinLength or proteinLength or 0
+  for i=1,n do
+    local a = Stats.segmentAttemptCount[i] or 0
+    local s = Stats.segmentSuccessCount[i] or 0
+    local sum = (Stats.segmentBBVarSum and Stats.segmentBBVarSum[i]) or 0
+    local cnt = (Stats.segmentBBVarCount and Stats.segmentBBVarCount[i]) or 0
+    local v = (cnt > 0 and sum > 0) and math.sqrt(sum / cnt) or 0
+    if a>0 and v~=0 then
+      table.insert(xs, v)            -- per-segment within-window std
+      table.insert(ys, s / a)        -- segment success rate
+    end
+  end
+  if #xs==0 then print("[Stats] No per-segment within-window BB data"); return end
+  print(string.format("[Stats] Corr(per-seg BB std within window, seg success rate) [L-corrected] = %.3f", _pearson(xs, ys)))
+end
+
+-- Correlate per-segment rank inefficiency with per-segment dispersion metrics
+-- Rank inefficiency map: fraction of events where pre-rank #1 did NOT win short-fuse (non-top1 short-win / attempts)
+-- Dispersion metrics:
+--   (1) Length-normalized avg dispersion per segment (across events): Stats._segmentDispersionAveragesLenNorm()
+--   (2) Within-window per-seg BB std (mean-centered, L-corrected): Stats._segmentBBStdWithinLcorrMap()
+function Stats.analyzeInefficiencyCorr(minAttempts)
+  local N = Stats.proteinLength or proteinLength or 0
+  if N <= 0 then print("[Stats] IneffCorr: no protein length"); return end
+  local minA = tonumber(minAttempts) or 1
+
+  local ineff = (Stats._segmentRankInefficiencyMap and Stats._segmentRankInefficiencyMap()) or {}
+  local disp_ln = (Stats._segmentDispersionAveragesLenNorm and Stats._segmentDispersionAveragesLenNorm()) or {}
+  local within  = (Stats._segmentBBStdWithinLcorrMap and Stats._segmentBBStdWithinLcorrMap()) or {}
+
+  local xs0, ys0 = {}, {}  -- ineff vs seg success rate
+  local xs1, ys1 = {}, {}  -- ineff vs len-norm seg dispersion
+  local xs2, ys2 = {}, {}  -- ineff vs within-window seg std
+
+  for i=1,N do
+    local a = (Stats.segmentAttemptCount and Stats.segmentAttemptCount[i]) or 0
+    if a >= minA then
+      local r = ineff[i] or 0
+      local s = (Stats.segmentSuccessCount and Stats.segmentSuccessCount[i]) or 0
+      xs0[#xs0+1], ys0[#ys0+1] = r, ((a>0) and (s/a) or 0)
+      local d = disp_ln[i] or 0
+      if d ~= 0 then xs1[#xs1+1], ys1[#ys1+1] = r, d end
+      local w = within[i] or 0
+      if w ~= 0 then xs2[#xs2+1], ys2[#ys2+1] = r, w end
+    end
+  end
+
+  if #xs0>0 then 
+    print(string.format("[Stats] Corr(rank inefficiency per seg, seg success rate) [minA=%d] = %.3f  (segs=%d)", minA, _pearson(xs0, ys0), #xs0))
+  else
+    print("[Stats] IneffCorr: no segments for success-rate corr")
+  end
+  if #xs1>0 then
+    print(string.format("[Stats] Corr(rank inefficiency per seg, len-norm bb_disp per seg) [minA=%d] = %.3f  (segs=%d)", minA, _pearson(xs1, ys1), #xs1))
+  else
+    print("[Stats] IneffCorr: no segments for len-norm dispersion")
+  end
+  if #xs2>0 then
+    print(string.format("[Stats] Corr(rank inefficiency per seg, per-seg BB std within window) [L-corrected, minA=%d] = %.3f  (segs=%d)", minA, _pearson(xs2, ys2), #xs2))
+  else
+    print("[Stats] IneffCorr: no segments for within-window BB std")
+  end
+end
 function Stats.analyzeRank()
   -- Evaluate how often pre-rank (SortByBackbone) top1 and pure BB top1 match the short-fuse winner
-  local byEvent = {}
-  for _,r in ipairs(Stats.shortCandidates) do
-    local t = byEvent[r.event_ix] or {}; byEvent[r.event_ix] = t
-    table.insert(t, r)
-  end
+  local byEvent = Stats._syn_build_by_event()
   local tot, hitsPre, hitsBB = 0, 0, 0
   local hitsScore, hitsStd = 0, 0
   local mrrPre, mrrBB, mrrScore, mrrStd = 0, 0, 0, 0
@@ -3867,8 +3941,12 @@ function Stats.analyzeRank()
   for ev, arr in pairs(byEvent) do
     if #arr >= 2 then -- meaningful only if >1
       tot = tot + 1
-      table.sort(arr, function(a,b) return (a.short_score or -1e9) > (b.short_score or -1e9) end)
-      local bestSlot = arr[1] and arr[1].slot or nil
+      -- find short-fuse winner slot without sorting
+      local bestSlot, bestShort = nil, -1e18
+      for _,x in ipairs(arr) do
+        local s = tonumber(x.short_score or -1e18) or -1e18
+        if s > bestShort then bestShort = s; bestSlot = x.slot end
+      end
       local minPre, bestBB = 1e9, -1e18
       local preSlot, bbSlot = nil, nil
       local scoreSlot, scoreBest = nil, -1e18
@@ -3945,8 +4023,6 @@ function Stats.analyzeRank()
         if r and r>0 then mrrStd = mrrStd + 1/r end
       end
       do
-        -- Draft is always recorded (fallback to pre if fuze_draft=false)
-        -- Only compute when at least one candidate has a numeric draft_score
         if draftSlot ~= nil then
           local copy = shallow_copy(arr)
           local r = find_rank_by(copy, function(x)
@@ -4010,171 +4086,24 @@ function Stats.analyzeRank()
     end
   end
   -- Synthetic ranking based on subscore correlations (incremental training on past events)
-  local function _sorted_event_keys(map)
-    local ks = {}
-    for k,_ in pairs(map) do ks[#ks+1] = k end
-    table.sort(ks, function(a,b) return (tonumber(a) or 0) < (tonumber(b) or 0) end)
-    return ks
-  end
-  local function _winner_slot(arr)
-    local copy = {}
-    for i=1,#arr do copy[i] = arr[i] end
-    table.sort(copy, function(a,b) return (a.short_score or -1e18) > (b.short_score or -1e18) end)
-    return copy[1] and copy[1].slot or nil
-  end
-  local function _event_feature_stats(arr, nparts)
-    local mu, sd, cnt = {}, {}, {}
-    for j=1,nparts do mu[j]=0; sd[j]=0; cnt[j]=0 end
-    for _,c in ipairs(arr) do
-      local a = c.subs_total
-      if a then
-        for j=1,nparts do
-          local v = a[j]
-          if type(v)=="number" then mu[j] = mu[j] + v; cnt[j] = cnt[j] + 1 end
-        end
-      end
-    end
-    for j=1,nparts do if cnt[j]>0 then mu[j] = mu[j] / cnt[j] else mu[j]=0 end end
-    for _,c in ipairs(arr) do
-      local a = c.subs_total
-      if a then
-        for j=1,nparts do
-          local v = a[j]
-          if type(v)=="number" then local d=v-mu[j]; sd[j]=sd[j]+d*d end
-        end
-      end
-    end
-    for j=1,nparts do if cnt[j]>1 then sd[j] = math.sqrt(sd[j]/(cnt[j]-1)) else sd[j]=0 end end
-    return mu, sd
-  end
-  -- Event-level mean/std for a scalar candidate field (e.g., draft_score)
-  local function _event_scalar_stats(arr, field)
-    local mu, cnt = 0, 0
-    for _,c in ipairs(arr) do
-      local v = c[field]
-      if type(v) == "number" then mu = mu + v; cnt = cnt + 1 end
-    end
-    if cnt > 0 then mu = mu / cnt else mu = 0 end
-    local var = 0
-    for _,c in ipairs(arr) do
-      local v = c[field]
-      if type(v) == "number" then local d = v - mu; var = var + d*d end
-    end
-    local sd = (cnt > 1) and math.sqrt(var / (cnt - 1)) or 0
-    return mu, sd
-  end
-  local function _compute_syn_weights_upto(limitEv)
-    if not (Stats.scoreParts and #Stats.scoreParts>0) then return nil,0 end
-    local parts = Stats.scoreParts
-    local np = #parts
-    local xs, ys = {}, {}
-    for j=1,np do xs[j] = {}; ys[j] = {} end
-    -- Optional extra feature: draft_score (only when fuze_draft is true)
-    local xsDraft, ysDraft = {}, {}
-    local includeDraft = (fuze_draft == true)
-    local evs = _sorted_event_keys(byEvent)
-    for _,ev in ipairs(evs) do
-      local iev = tonumber(ev) or 0
-      if iev < (tonumber(limitEv) or 0) then
-        local arr = byEvent[ev]
-        if arr and #arr >= 2 then
-          local wslot = _winner_slot(arr)
-          local mu, sd = _event_feature_stats(arr, np)
-          local muD, sdD = 0, 0
-          if includeDraft then muD, sdD = _event_scalar_stats(arr, "draft_score") end
-          local constMap = Stats.constSubscoreParts and Stats.constSubscoreParts[ev] or {}
-          for _,c in ipairs(arr) do
-            local y = (c.slot == wslot) and 1 or 0
-            local a = c.subs_total
-            if a then
-              for j=1,np do
-                if not (constMap and constMap[j]) then
-                  local v = a[j]
-                  if type(v)=="number" and (sd[j] or 0) > 0 then
-                    local z = (v - (mu[j] or 0)) / (sd[j] or 1)
-                    xs[j][#xs[j]+1] = z; ys[j][#ys[j]+1] = y
-                  end
-                end
-              end
-            end
-            if includeDraft and (sdD or 0) > 0 then
-              local dv = c.draft_score
-              if type(dv) == "number" then
-                local dz = (dv - (muD or 0)) / (sdD or 1)
-                xsDraft[#xsDraft+1] = dz; ysDraft[#ysDraft+1] = y
-              end
-            end
-          end
-        end
-      end
-    end
-    local w = {}; local used = 0
-    for j=1,(Stats.scoreParts and #Stats.scoreParts or 0) do
-      local r = _pearson(xs[j], ys[j])
-      if r ~= 0 and r == r then used = used + 1 end
-      w[j] = r or 0
-    end
-    if includeDraft then
-      local rd = _pearson(xsDraft, ysDraft)
-      if rd ~= 0 and rd == rd then used = used + 1 end
-      w._draft = rd or 0
-    end
-    return w, used
-  end
-  local function _syn_rank_for_event(arr, weights)
-    local np = (Stats.scoreParts and #Stats.scoreParts) or 0
-    if np == 0 then return nil, nil end
-    local mu, sd = _event_feature_stats(arr, np)
-    local useDraft = (fuze_draft == true) and (weights and (weights._draft or 0) ~= 0)
-    local muD, sdD = 0, 0
-    if useDraft then muD, sdD = _event_scalar_stats(arr, "draft_score") end
-    local scored = {}
-    for _,c in ipairs(arr) do
-      local s = 0
-      local a = c.subs_total
-      if a then
-        for j=1,np do
-          local denom = sd[j] or 0
-          if denom and denom > 0 then
-            local v = a[j]
-            if type(v)=="number" then
-              local z = (v - (mu[j] or 0)) / denom
-              s = s + (weights[j] or 0) * z
-            end
-          end
-        end
-      end
-      if useDraft and (sdD or 0) > 0 then
-        local v = c.draft_score
-        if type(v) == "number" then
-          local z = (v - (muD or 0)) / (sdD or 1)
-          s = s + (weights._draft or 0) * z
-        end
-      end
-      scored[#scored+1] = {slot=c.slot, score=s}
-    end
-    table.sort(scored, function(a,b)
-      if (a.score or 0) == (b.score or 0) then return (a.slot or 0) < (b.slot or 0) end
-      return (a.score or 0) > (b.score or 0)
-    end)
-    local order = {}
-    for i=1,#scored do order[i] = scored[i].slot end
-    local top = scored[1] and scored[1].slot or nil
-    return top, order
-  end
   local totSyn, hitsSyn, mrrSyn = 0, 0, 0
   do
-    local evs = _sorted_event_keys(byEvent)
+    local evs = _syn_sorted_event_keys(byEvent)
     for _,ev in ipairs(evs) do
       local arr = byEvent[ev]
       if arr and #arr >= 2 then
-        local wts, used = _compute_syn_weights_upto(ev)
+        local wts, used = Stats.syn_compute_weights(ev)
         if wts and used and used > 0 then
-          local wslot = _winner_slot(arr)
+          -- find short-fuse winner without sorting
+          local wslot, wbest = nil, -1e18
+          for _,x in ipairs(arr) do
+            local s = tonumber(x.short_score or -1e18) or -1e18
+            if s > wbest then wbest = s; wslot = x.slot end
+          end
           local top, order = _syn_rank_for_event(arr, wts)
           if top ~= nil then
             totSyn = totSyn + 1
-            if top == wslot then hitsSyn = hitsSyn + 1 end
+            if wslot ~= nil and top == wslot then hitsSyn = hitsSyn + 1 end
             if order and wslot ~= nil then
               local rk = nil
               for i=1,#order do if order[i] == wslot then rk = i; break end end
@@ -4212,86 +4141,17 @@ function Stats.analyzeRank()
   print(string.format("[Stats] Short-fuze MRR (1/position) by rank type: pre=%.3f, bb=%.3f, score=%.3f, standard=%.3f, draft=%.3f, draft_bb=%.3f, syn=%.3f", mrrPreV, mrrBBV, mrrScoreV, mrrStdV, mrrDraftV, mrrDraftBBV, mrrSynV))
 
   -- Correlation of each ranking’s reciprocal rank of the final winner with final success
-  local function _pear(xs, ys)
-    return _pearson(xs, ys)
-  end
-  local rPre    = _pear(corrData.pre.xs,      corrData.pre.ys)
-  local rBB     = _pear(corrData.bb.xs,       corrData.bb.ys)
-  local rScore  = _pear(corrData.score.xs,    corrData.score.ys)
-  local rStd    = _pear(corrData.std.xs,      corrData.std.ys)
-  local rDraft  = _pear(corrData.draft.xs,    corrData.draft.ys)
-  local rDraftB = _pear(corrData.draft_bb.xs, corrData.draft_bb.ys)
-  local rSyn    = _pear(corrData.syn.xs,     corrData.syn.ys)
+  local rPre    = _pearson(corrData.pre.xs,      corrData.pre.ys)
+  local rBB     = _pearson(corrData.bb.xs,       corrData.bb.ys)
+  local rScore  = _pearson(corrData.score.xs,    corrData.score.ys)
+  local rStd    = _pearson(corrData.std.xs,      corrData.std.ys)
+  local rDraft  = _pearson(corrData.draft.xs,    corrData.draft.ys)
+  local rDraftB = _pearson(corrData.draft_bb.xs, corrData.draft_bb.ys)
+  local rSyn    = _pearson(corrData.syn.xs,     corrData.syn.ys)
   print(string.format("[Stats] Corr(1/rank_final, success): pre=%.3f, bb=%.3f, score=%.3f, standard=%.3f, draft=%.3f, draft_bb=%.3f, syn=%.3f", rPre or 0, rBB or 0, rScore or 0, rStd or 0, rDraft or 0, rDraftB or 0, rSyn or 0))
 
   -- Subscore leaders list moved to combined output (Stats.analyzeSubsCombined).
 end
-
-
--- BB dispersion vs probability that pre-rank top1 wins after short-fuse (event-level)
-function Stats.analyzeVarVsShortTop1()
-  -- event -> bb_std (len-normalized)
-  local bsd = Stats._eventLenNormBBStdMap()
-
-  -- group short-fuse candidates by event
-  local byEvent = {}
-  for _,r in ipairs(Stats.shortCandidates or {}) do
-    local t = byEvent[r.event_ix] or {}; byEvent[r.event_ix] = t
-    table.insert(t, r)
-  end
-
-  local xs, ys = {}, {}
-  local xmin, xmax = 1e9, -1e9
-  local eventsUsed = 0
-  for ev, arr in pairs(byEvent) do
-    if #arr >= 2 then
-      local x = bsd[ev]
-      if x ~= nil then
-        -- did pre-rank==1 win on short fuse?
-        table.sort(arr, function(a,b) return (a.short_score or -1e18) > (b.short_score or -1e18) end)
-        local best = arr[1] and (arr[1].short_score or -1e18) or -1e18
-        local top1won = 0
-        for _,c in ipairs(arr) do
-          if c.pre_rank == 1 and (c.short_score or -1e18) == best then top1won = 1; break end
-        end
-        xs[#xs+1] = x; ys[#ys+1] = top1won
-        if x < xmin then xmin = x end; if x > xmax then xmax = x end
-        eventsUsed = eventsUsed + 1
-      end
-    end
-  end
-
-  if #xs == 0 then
-    print("[Stats] Var→Top1: no data (need slotsToFuze>1 and shortCandidates)")
-    return
-  end
-
-  print(string.format("[Stats] Corr(bb_std_norm, Top1 short-win) = %.3f (events=%d)", _pearson(xs, ys), eventsUsed))
-
-  -- Bin P(Top1 wins) by bb_std
-  local nb = 4
-  if xmax <= xmin then xmin = xmin - 0.5; xmax = xmax + 0.5 end
-  local w = (xmax - xmin) / nb
-  local bc, bw = {}, {}
-  for i=1,nb do bc[i]=0; bw[i]=0 end
-  local function bin_ix(x)
-    local t = math.floor((x - xmin) / w) + 1
-    if t < 1 then t = 1 end
-    if t > nb then t = nb end
-    return t
-  end
-  for i=1,#xs do
-    local b = bin_ix(xs[i]); bc[b] = bc[b] + 1; bw[b] = bw[b] + (ys[i] or 0)
-  end
-  print("[Stats] P(Top1 short-win) by bb_std_norm bins:")
-  for i=1,nb do
-    local lo = xmin + (i-1)*w
-    local hi = (i==nb) and xmax or (xmin + i*w)
-    local p = (bc[i]>0) and (100*bw[i]/bc[i]) or 0
-    print(string.format("  [%-6s .. %-6s]  P=%.1f%%  (n=%d)", _fmt(lo), _fmt(hi), p, bc[i]))
-  end
-end
-
 
 -- BB dispersion vs probability of final success (binary)
 function Stats.analyzeVarFinalBins()
@@ -4327,7 +4187,6 @@ function Stats.analyzeVarFinalBins()
     print(string.format("  [%-6s .. %-6s]  P=%.1f%%  (n=%d)", _fmt(lo), _fmt(hi), p, n))
   end
 end
-
 
 -- Split event-level dispersion into directional (PC1) vs residual, and relate to success
 function Stats.analyzeDispersionSplit()
@@ -4384,6 +4243,8 @@ function Stats.analyzeDispersionSplit()
 
   local ySuc = {}
   local anis, vperp, gaps, frhard = {}, {}, {}, {}
+  -- hotspot concentration per event (count above 80th percentile and share of top-2 among hotspot intensities)
+  local hotcnt, top2share = {}, {}
 
   local parts = Stats.scoreParts or {}
   for ev, arr in pairs(byEvent) do
@@ -4437,7 +4298,7 @@ function Stats.analyzeDispersionSplit()
         end
         local gap = 0
         if #proj>0 then gap = proj[#proj] - median(proj) end
-        -- frac_hard in window
+        -- frac_hard in window and hotspot concentration
         local fh = 0
         do
           local w = evWin[ev]
@@ -4445,8 +4306,24 @@ function Stats.analyzeDispersionSplit()
             local s = math.max(1, w[1] or 1); local e = math.min(proteinLength or 0, w[2] or 0)
             local L = math.max(1, e - s + 1)
             local hc = 0
-            for i=s,e do if (disp_ln[i] or 0) >= thr80 then hc = hc + 1 end end
+            local hv = {}
+            for i=s,e do
+              local v = disp_ln[i] or 0
+              if v >= thr80 then hc = hc + 1; hv[#hv+1] = v end
+            end
             fh = hc / L
+            -- hotspot concentration: share of top-2 hotspot intensities among all hotspots in the window
+            local t2s = 0
+            if #hv > 0 then
+              table.sort(hv, function(a,b) return (a or 0) > (b or 0) end)
+              local tot = 0; for _,vv in ipairs(hv) do tot = tot + (vv or 0) end
+              local top2 = (hv[1] or 0) + (hv[2] or 0)
+              t2s = (tot > 0) and (top2 / tot) or 1
+            else
+              t2s = 0
+            end
+            hotcnt[#hotcnt+1] = hc
+            top2share[#top2share+1] = t2s
           end
         end
         -- collect
@@ -4492,7 +4369,7 @@ function Stats.analyzeDispersionSplit()
   local bins = {ll={n=0,s=0}, lh={n=0,s=0}, hl={n=0,s=0}, hh={n=0,s=0}}
   for i=1,nE do
     local a = (anis[i] or 0) >= an_med
-    local f = (frhard[i] or 0) >= fh_med
+    local f = (frhard[i] or 0) > fh_med
     local key = (a and f) and 'hh' or (a and not f) and 'hl' or (not a and f) and 'lh' or 'll'
     bins[key].n = bins[key].n + 1
     bins[key].s = bins[key].s + (ySuc[i] or 0)
@@ -4503,35 +4380,21 @@ function Stats.analyzeDispersionSplit()
   print(string.format("  high aniso, low hard: P=%.1f%% (n=%d)", pr(bins.hl), bins.hl.n))
   print(string.format("  low aniso, high hard: P=%.1f%% (n=%d)", pr(bins.lh), bins.lh.n))
   print(string.format("  high aniso, high hard: P=%.1f%% (n=%d)", pr(bins.hh), bins.hh.n))
-end
--- BB dispersion vs final outcome magnitude (event-level): final event_delta
-function Stats.analyzeVarVsFinalDelta()
-  local evX = Stats._eventLenNormBBStdMap()
-  local xs, ys, idx = {}, {}, {}
-  for _,r in ipairs(Stats.final or {}) do
-    local x = evX[r.event_ix]
-    if x ~= nil then
-      xs[#xs+1] = x; ys[#ys+1] = tonumber(r.event_delta or 0) or 0
-      idx[#idx+1] = #xs
+  -- Hotspot concentration summary
+  do
+    local function avg_of(t)
+      local s=0; for i=1,#t do s=s+(t[i] or 0) end; return (#t>0) and (s/#t) or 0
     end
-  end
-  if #xs == 0 then
-    print("[Stats] Var→FinalDelta: no data (need candidates+final)")
-    return
-  end
-  print(string.format("[Stats] Corr(bb_std_norm, final delta) = %.3f (events=%d)", _pearson(xs, ys), #xs))
-  -- Quantile bins: mean final delta
-  local nb = 4
-  table.sort(idx, function(a,b) return xs[a] < xs[b] end)
-  print("[Stats] E[final delta] by bb_std_norm quantiles:")
-  for b=1,nb do
-    local lo_i = math.floor((b-1) * #idx / nb) + 1
-    local hi_i = (b == nb) and #idx or math.floor(b * #idx / nb)
-    local lo = xs[idx[lo_i]]; local hi = xs[idx[hi_i]]
-    local n, s = 0, 0
-    for k=lo_i,hi_i do local i = idx[k]; n = n + 1; s = s + (ys[i] or 0) end
-    local mean = (n>0) and (s/n) or 0
-    print(string.format("  [%-6s .. %-6s]  mean=%.3f  (n=%d)", _fmt(lo), _fmt(hi), mean, n))
+    local function median_of(t)
+      local a={}; for i=1,#t do a[i]=t[i] or 0 end
+      table.sort(a); local m=#a; if m==0 then return 0 end
+      if (m%2)==1 then return a[(m+1)/2] else return 0.5*(a[m/2]+a[m/2+1]) end
+    end
+    local hc_avg, hc_med = avg_of(hotcnt), median_of(hotcnt)
+    local t2_avg, t2_med = avg_of(top2share), median_of(top2share)
+    print("[Stats] Hotspot concentration (80p threshold):")
+    print(string.format("  hot_count: avg=%s, median=%s", _fmt(hc_avg), _fmt(hc_med)))
+    print(string.format("  top2_share among hotspots: avg=%s, median=%s", _fmt(t2_avg), _fmt(t2_med)))
   end
 end
 
@@ -4640,39 +4503,15 @@ function Stats.printAllCorrelations()
   if Stats.analyzeRules then run("analyzeRules", Stats.analyzeRules) end
   if Stats.analyzeRank then run("analyzeRank", Stats.analyzeRank) end
   if Stats.analyzeAA then run("analyzeAA", Stats.analyzeAA) end
+  if Stats.analyzeSubsCombined then run("analyzeSubsCombined", Stats.analyzeSubsCombined) end
   if Stats.analyzeSS then run("analyzeSS", Stats.analyzeSS) end
   if Stats.analyzeVariability then run("analyzeVariability", Stats.analyzeVariability) end
   if Stats.analyzeSegVarVsSuccess then run("analyzeSegVarVsSuccess", Stats.analyzeSegVarVsSuccess) end
-  if Stats.analyzeSubsCombined then run("analyzeSubsCombined", Stats.analyzeSubsCombined) end
+  if Stats.analyzeSegVarWithinVsSuccess then run("analyzeSegVarWithinVsSuccess", Stats.analyzeSegVarWithinVsSuccess) end
+  if Stats.analyzeInefficiencyCorr then run("analyzeInefficiencyCorr", Stats.analyzeInefficiencyCorr) end
   if Stats.analyzeDispersionSplit then run("analyzeDispersionSplit", Stats.analyzeDispersionSplit) end
   if Stats.analyzeLoopSeg then run("analyzeLoopSeg", Stats.analyzeLoopSeg) end
   if Stats.analyzeVarFinalBins then run("analyzeVarFinalBins", Stats.analyzeVarFinalBins) end
-end
-
--- Correlation: per-solution total subscores vs final selection (binary)
-function Stats.analyzeSolutionSubsFinal(topN)
-  -- Kept for compatibility; prefer Stats.analyzeSubsCombined() for unified output.
-  if not (Stats.scoreParts and #Stats.scoreParts>0) then print("[Stats] no scoreParts"); return end
-  local parts = Stats.scoreParts
-  local acc = {}
-  for j=1,#parts do
-    local xs, ys = {}, {}
-    for _,r in ipairs(Stats.shortCandidates) do
-      local a = r.subs_total; local y = (tonumber(r.is_final) or 0)
-      local ev = r.event_ix
-      local const = Stats.constSubscoreParts and Stats.constSubscoreParts[ev] and Stats.constSubscoreParts[ev][j]
-      if (not const) and a and type(a[j])=="number" then
-        xs[#xs+1] = a[j]; ys[#ys+1] = y
-      end
-    end
-    local rv = _pearson(xs, ys)
-    acc[#acc+1] = {name=tostring(parts[j]), r=rv, ar=math.abs(rv)}
-  end
-  table.sort(acc, function(a,b) return (a.ar or 0)>(b.ar or 0) end)
-  print("[Stats] Corr(subs_total, is_final): top "..tostring(math.min(topN or #acc, #acc)))
-  for i=1,math.min(topN or #acc,#acc) do
-    print(string.format("  %-20s r=% .3f", acc[i].name, acc[i].r or 0))
-  end
 end
 
 -- Unified output: per-subscore short-fuze Top1 accuracy (leaders) + correlation with final (is_final)
