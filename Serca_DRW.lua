@@ -1,4 +1,8 @@
 --[[
+todo:
+    multiple rebuilds
+    don't touch weight of the rule map with zeroes (r6 discrimination)
+
 
 ChangeLog:
     v2.2 - Major refactoring
@@ -31,8 +35,6 @@ Shift rndsNoGain -- how many iterations with no score increase before the script
 With cuts -- rebuild with cuts for the final-stage rebuilds
 
 
-
-
 [to ChatGPT:] please update the line numbers to the actual ones, if you add/remove a lot of code above these function
 [to ChatGPT:] you can add some major functions here too with their lines for better management
   Major functions:
@@ -45,7 +47,7 @@ With cuts -- rebuild with cuts for the final-stage rebuilds
         
 stats sections 2680
 ]]
-version = "2.1.74" -- [to GPT:] on every code modification increment the last number
+version = "2.1.81" -- [to GPT:] on every code modification increment the last number
 script_name = "Serca DRW "
 print (script_name..version) 
 
@@ -77,7 +79,6 @@ convertLoop = convertHelixToLoop or convertSheetsToLoop
 -- this is to analyze the stats of convertion efficacy
 convertToLoopProb = 0.5
 
-shiftFuze = -1
 currentFuze = 1
 remixNotRebuild = false
 consecutiveRounds = true
@@ -124,10 +125,11 @@ EndRebuild = END_REBUILD_NOCUTS
 -- Will be set by applyDialogDefaults(); defined here for clarity
 fuzeAfternoGain = nil
 shiftNoGain = nil
+ruleWeightNoGain = 30
 
 fuzeAfternoGain_counter = 0
 shiftNoGain_counter = 0
-shiftFuze_counter = 0
+ruleWeightNoGain_counter = 0
 
 startingAA=1
 
@@ -206,15 +208,16 @@ selectionStrategy = SELECTION_STRATEGY.DYNAMIC
 -- The tweakable constants below set how strong each rule is and how fast Rule 1 fades and Rule 3 grows.
 --  Rule 0 — Success-rate map: segments with higher success ratio (successes/attempts)
 --           get higher priority persistently.
-dyn_rule0_weight = 2.0   -- weight for Rule 0 (success ratio)
-dyn_rule1_weight = 1.0   -- weight for Rule 1 (aggregated impact of accepted rebuilds)
-dyn_rule2_weight = 1.0   -- age since last rebuild (in events)
-dyn_rule2_ageScale = 100 -- scale for typical age; used implicitly via min-max; keep for reference
-dyn_rule3_weight = -0.4  -- aggregated magnitude of |Score - Score_at_last_no_gain| (default inverted)
-dyn_rule4_weight = 0.3   -- low per-segment Score gets more points
-dyn_rule5_weight = 0.3   -- low per-segment ScoreBB gets more points
+-- Migrate to a unified array of rule weights: dyn_rule_weight[0..6]
+dyn_rule_weight = {}
+dyn_rule_weight[0] = 0.5   -- R0: success ratio
+dyn_rule_weight[1] = 1.0   -- R1: aggregated impact of accepted rebuilds
+dyn_rule_weight[2] = 1.0   -- R2: age since last rebuild (in events)
+dyn_rule_weight[3] = -0.4  -- R3: aggregated |Score - Score_at_last_no_gain| (default inverted)
+dyn_rule_weight[4] = 0.3   -- R4: low per-segment Score gets more points
+dyn_rule_weight[5] = 0.3   -- R5: low per-segment ScoreBB gets more points
 -- Rule 6 — User map from Notes (base62 0-9,a-z,A-Z). Higher char → higher priority.
-dyn_rule6_weight = 2.0   -- default weight; can be changed via Notes
+dyn_rule_weight[6] = 2.0   -- R6: default weight; can be changed via Notes
 rule6_lastString = nil   -- last accepted raw base62 string from Notes
 rule6_mapNorm = {} -- Initialize Rule 6 normalized map with zeros (no effect) by default
 for i = 1, proteinLength do rule6_mapNorm[i] = 0 end
@@ -240,7 +243,16 @@ local function _recalc_agg_decays()
     dyn_rule1_agg_decay = _agg_decay_from_half_life(R1_DECAY_EVENTS)
     dyn_rule3_agg_decay = _agg_decay_from_half_life(R3_DECAY_EVENTS)
 end
-
+-- Structure to auto adjust rules weights every fuze 
+-- Auto-tuning structure now works directly with dyn_rule_weight array (indices 1..6)
+ruleTuning = {
+    [1] = {step = 0.2, min = 0.2, max = 3.0, desired_sign =  1},
+    [2] = {step = 0.2, min = 0.2, max = 2.5, desired_sign =  1},
+    [3] = {step = 0.1, min = -2.0, max = -0.1, desired_sign = -1},
+    [4] = {step = 0.1, min = 0.1, max = 1.5, desired_sign =  1},
+    [5] = {step = 0.1, min = 0.1, max = 1.5, desired_sign =  1},
+    [6] = {step = 0.2, min = 0.0, max = 2.5, desired_sign =  1},
+}
 
 -- Dynamic selection tracking state (filled at runtime)
 segLastRebuildEventIx = {}
@@ -360,9 +372,9 @@ function main()
     -- Initialize dynamic tracking arrays with current per-segment scores
     for i = 1, proteinLength do
         segLastRebuildEventIx[i] = 0
-        local s = current.GetSegmentEnergyScore(i)
-        segScoreAtLastSuccess[i] = s
-        segScoreAtLastNoGain[i]  = s
+        local currentSegmentScore = current.GetSegmentEnergyScore(i)
+        segScoreAtLastSuccess[i] = currentSegmentScore
+        segScoreAtLastNoGain[i]  = currentSegmentScore
         segRebuildCount[i] = 0
         segImpactLastSuccess[i] = 0
         segImpactLastNoGain[i] = 0
@@ -428,9 +440,8 @@ function main()
             if consecutiveRounds then
                 fuzeAfternoGain_counter = 0
                 shiftNoGain_counter = 0
-                shiftFuze_counter = 0
             end
-            -- Update baseline for Rule 1 (after success): capture current per-segment scores
+            -- Update map for Rule 1 (after success): capture current per-segment scores
             lastSuccessEventIndex = eventsProcessedCounter
             for i = 1, proteinLength do
                 segScoreAtLastSuccess[i] = current.GetSegmentEnergyScore(i)
@@ -439,16 +450,16 @@ function main()
             consecutiveNoGainEvents = consecutiveNoGainEvents + 1
             fuzeAfternoGain_counter = fuzeAfternoGain_counter + 1
             shiftNoGain_counter = shiftNoGain_counter + 1
-            shiftFuze_counter = shiftFuze_counter + 1
-            -- Update baseline for Rule 3 (after an unsuccessful event)
+            -- Update map for Rule 3 (after an unsuccessful event)
             for i = 1, proteinLength do
                 segScoreAtLastNoGain[i] = current.GetSegmentEnergyScore(i)
             end
         end
+        ruleWeightNoGain_counter = ruleWeightNoGain_counter + 1
 
         -- Adjust after event if thresholds reached
         -- Switch to fuzed version
-        if (fuzeAfternoGain == 0) or ((fuzeAfternoGain_counter >= fuzeAfternoGain) and (fuzeAfternoGain>0)) then
+        if fuzeAfternoGain_counter >= fuzeAfternoGain then
             if reportLevel>1 then 
                 print ("No-gain:"..consecutiveNoGainEvents,
                        "/ counters: fuze ".. fuzeAfternoGain_counter,
@@ -462,23 +473,12 @@ function main()
             FuzeNumber = FuzeNumber + 1
             if reportLevel>1 then print ("Switched to fuzed version ".. ScoreReturn().." (was "..lastScore..")") end
             if reportLevel>2 then ShowRebuildFrequency() end
-        end
 
-        -- Change fuze type periodically (disabled)
-        if (shiftFuze_counter >= shiftFuze) and (shiftFuze>0) then
-            shiftFuze_counter = 0
-            if currentFuze == 2 then 
-                currentFuze = 1
-                if reportLevel>1 then print ("Switched to Fuze1. (events with no gain="..shiftFuze..")") end
-            else
-                if reportLevel>1 then print ("Switched to Fuze2. (events with no gain="..shiftFuze..")") end
-                currentFuze = 2
-            end
-            if reportLevel>2 then ShowRebuildFrequency() end
+
         end
 
         -- Decrease selection length after X no-gain events
-        if (shiftNoGain > 0) and (shiftNoGain_counter >= shiftNoGain) then
+        if shiftNoGain_counter >= shiftNoGain then
             if StartRebuild ~= EndRebuild then
                 shiftNoGain_counter = 0
                 selectionLength = selectionLength - 1
@@ -493,6 +493,11 @@ function main()
                 if reportLevel>2 then ShowRebuildFrequency() end
             end
         end
+
+        -- Auto-adjust choose next selection rules weights every ruleWeightNoGain rounds
+        if ruleWeightNoGain_counter >= ruleWeightNoGain then
+            ruleWeightNoGain_counter = 0
+            if Stats and Stats.enabled then AutoAdjustRuleWeights() end        end
 
         if selectionStrategy == SELECTION_STRATEGY.STATIC then
             staticIndex = staticIndex + 1
@@ -535,7 +540,7 @@ function ProcessSelectionEvent()
     -- Convert to Helices/Sheets to loop. This influences the rebuild solutions.
     -- Converting H/S to loop with probability p
     local p = convertToLoopProb
-    local forced = math.random() < p)
+    local forced = math.random() < p
     local convHCnt, convECnt = 0, 0
     if forced or (p == 0 and convertLoop) then
       save.LoadSecondaryStructure()  -- restore original secondary structure только если будет конверсия
@@ -1214,10 +1219,10 @@ function RequestOptions()
 
     ask.l3 = dialog.AddLabel("Do after X rebuilds with NoGain:")
     ask.consecutiveRounds=dialog.AddCheckbox("Consecutive Events", consecutiveRounds)
-    local fuzeMaxCap = math.min(SLIDER_CAP_ABSOLUTE, math.max(1, math.floor((fuzeAfternoGain > 0 and fuzeAfternoGain or 1) * FUZE_SLIDER_MAX_MULT + 0.5)))
-    local shiftMaxCap = math.min(SLIDER_CAP_ABSOLUTE, math.max(1, math.floor((shiftNoGain > 0 and shiftNoGain or 1) * SHIFT_SLIDER_MAX_MULT + 0.5)))
-    ask.fuzeAfternoGain = dialog.AddSlider("Fuze events NoGain",fuzeAfternoGain,-1,fuzeMaxCap,0)  -- -1: accept fuzed solution on highscore; 0: switch every event; >0: after N no-gain events
-    ask.shiftNoGain = dialog.AddSlider("Shift events NoGain",shiftNoGain,-1,shiftMaxCap,0)
+    local fuzeMaxCap = math.min(SLIDER_CAP_ABSOLUTE, math.max(1, math.floor(fuzeAfternoGain * FUZE_SLIDER_MAX_MULT + 0.5)))
+    local shiftMaxCap = math.min(SLIDER_CAP_ABSOLUTE, math.max(1, math.floor(shiftNoGain * SHIFT_SLIDER_MAX_MULT + 0.5)))
+    ask.fuzeAfternoGain = dialog.AddSlider("Fuze events NoGain",fuzeAfternoGain,0,fuzeMaxCap,0)  -- -1: accept fuzed solution on highscore; 0: switch every event; >0: after N no-gain events
+    ask.shiftNoGain = dialog.AddSlider("Shift events NoGain",shiftNoGain,0,shiftMaxCap,0)
     ask.stopAfter = dialog.AddSlider("Stop After (rebuilds)",0,0,1000,0)
 
     ask.l4 = dialog.AddLabel("Service:")
@@ -1260,7 +1265,6 @@ function RequestOptions()
     	startCI=1 --ask.startCI.value
     	useSlot98 =ask.useSlot98.value
     	consecutiveRounds =ask.consecutiveRounds.value
-    	--shiftFuze=ask.shiftFuze.value
 
     	fuzeAfternoGain=ask.fuzeAfternoGain.value
     	shiftNoGain=ask.shiftNoGain.value
@@ -1318,8 +1322,95 @@ function RequestOptions()
 end
 
 
-
 --------------------------------------------------------------------------------- Rules ---------------------------------------------------------------------------------
+
+-- Auto-tuning selection search rules according to results
+local delta_threshold  = 0.002 -- minimal |Δ| worth reacting to
+local function computeRuleMetrics()
+    local rows = Stats.candidates or {}
+    local evSuc = _event_success_map()
+    local metrics = {}
+  
+    for _, name in ipairs({"R1","R2","R3","R4","R5","R6"}) do
+      local xs, ys = {}, {}
+      for _, row in ipairs(rows) do
+        local y = evSuc[row.event_ix]
+        if y ~= nil then
+          xs[#xs+1] = tonumber(row[name] or 0) or 0
+          ys[#ys+1] = y
+        end
+      end
+      local r = _pearson(xs, ys)
+      local mSucc, mFail, nSucc, nFail = 0, 0, 0, 0
+      for i, y in ipairs(ys) do
+        if y == 1 then
+          mSucc = mSucc + xs[i]; nSucc = nSucc + 1
+        else
+          mFail = mFail + xs[i]; nFail = nFail + 1
+        end
+      end
+      local delta = ((nSucc > 0) and (mSucc / nSucc) or 0) - ((nFail > 0) and (mFail / nFail) or 0)
+      metrics[name] = {r = r or 0, delta = delta or 0}
+    end
+    return metrics
+end
+  
+local norm_target_l1 -- summ of the weights to normalize weights level |w1..w6|
+
+function AutoAdjustRuleWeights()
+    -- initializing weights normalization level on start
+    if not norm_target_l1 then
+        local s = 0
+        for i = 1, 6 do s = s + math.abs(dyn_rule_weight[i]) end
+        norm_target_l1 = (s > 0) and s or 1
+    end
+
+    local metrics = computeRuleMetrics()
+
+    for i = 1, 6 do
+        local cfg = ruleTuning[i]
+        if cfg then
+            local m = metrics["R"..i]
+            if m then
+                local w = dyn_rule_weight[i]
+                local delta = m.delta
+                local sign_ok = (delta ~= 0) and ((delta * (cfg.desired_sign or 1)) > 0)
+
+                if math.abs(delta) >= delta_threshold and sign_ok then
+                    w = math.min(cfg.max, w + cfg.step)
+                else
+                    w = math.max(cfg.min, w - cfg.step)
+                end
+                dyn_rule_weight[i] = w
+            end
+        end
+    end
+    -- === Normalize weights after modification ===
+    do
+        local s = 0
+        for i = 1, 6 do s = s + math.abs(dyn_rule_weight[i]) end
+        if s > 0 then
+            local k = norm_target_l1 / s
+            for i = 1, 6 do
+                local w = dyn_rule_weight[i] * k
+                local cfg = ruleTuning[i]
+                if cfg then
+                    -- repsect min/max after scaling
+                    if w < cfg.min then w = cfg.min elseif w > cfg.max then w = cfg.max end
+                end
+                dyn_rule_weight[i] = w
+            end
+        end
+    end
+
+    if reportLevel > 1 then
+        print(string.format(
+            "[Rules] Weights: R0=%.1f R1=%.1f R2=%.1f R3=%.1f R4=%.1f R5=%.1f R6=%.1f",
+            unpack(dyn_rule_weight, 0, 6)
+        ))
+    end
+end
+
 -- On-demand dynamic rule scoring (replicates the scoring used by NextSelectionDynamic)
 function ComputeDynamicRuleScores()
     local r0Raw, r1Raw, r2Raw, r3Raw, r4Raw, r5Raw = {}, {}, {}, {}, {}, {}
@@ -1378,19 +1469,19 @@ function ComputeDynamicRuleScores()
 
     local cont0, cont1, cont2, cont3, cont4, cont5, cont6, points = {}, {}, {}, {}, {}, {}, {}, {}
     for i = 1, proteinLength do
-        local r0 = dyn_rule0_weight * norm(r0Raw[i], r0min, r0max)
-        local r1 = dyn_rule1_weight * norm(r1Raw[i], r1min, r1max)
-        local r2 = dyn_rule2_weight * norm(r2Raw[i], r2min, r2max)
-        local r3 = dyn_rule3_weight * norm(r3Raw[i], r3min, r3max)
+        local r0 = (dyn_rule_weight[0] or 0) * norm(r0Raw[i], r0min, r0max)
+        local r1 = (dyn_rule_weight[1] or 0) * norm(r1Raw[i], r1min, r1max)
+        local r2 = (dyn_rule_weight[2] or 0) * norm(r2Raw[i], r2min, r2max)
+        local r3 = (dyn_rule_weight[3] or 0) * norm(r3Raw[i], r3min, r3max)
         -- For r4/r5 lower values should get higher points → invert
         local r4 = 0
-        if sMax > sMin then r4 = dyn_rule4_weight * ((sMax - r4Raw[i]) / (sMax - sMin)) end
+        if sMax > sMin then r4 = (dyn_rule_weight[4] or 0) * ((sMax - r4Raw[i]) / (sMax - sMin)) end
         local r5 = 0
-        if bbMax > bbMin then r5 = dyn_rule5_weight * ((bbMax - r5Raw[i]) / (bbMax - bbMin)) end
+        if bbMax > bbMin then r5 = (dyn_rule_weight[5] or 0) * ((bbMax - r5Raw[i]) / (bbMax - bbMin)) end
 
-        -- Rule 6: user map (normalized [0..1]) scaled by dyn_rule6_weight
+        -- Rule 6: user map (normalized [0..1]) scaled by dyn_rule_weight[6]
         local r6 = 0
-        if rule6_mapNorm then r6 = (rule6_mapNorm[i] or 0) * (dyn_rule6_weight or 0) end
+        if rule6_mapNorm then r6 = (rule6_mapNorm[i] or 0) * (dyn_rule_weight[6] or 0) end
 
         cont0[i], cont1[i], cont2[i], cont3[i], cont4[i], cont5[i], cont6[i] = r0, r1, r2, r3, r4, r5, r6
         points[i] = (r0 + r1 + r2 + r3 + r4 + r5 + r6)
@@ -1546,7 +1637,7 @@ local function PrintRule6Bar()
     local pal = getBarPalette(BAR_STYLE.BASE10)
     local cont6 = {}
     for i = 1, proteinLength do
-        cont6[i] = (rule6_mapNorm and rule6_mapNorm[i] or 0) * (dyn_rule6_weight or 0)
+        cont6[i] = (rule6_mapNorm and rule6_mapNorm[i] or 0) * (dyn_rule_weight[6] or 0)
     end
     print("R6 "..encodeScalarArrayToBar(cont6, pal))
 end
@@ -1644,7 +1735,7 @@ function ProcessNoteCommands(noteText)
     if has("mapw") then
         local wnum = tonumber(lower:match("mapw%s*=?%s*([%+%-%d%.]+)") or "")
         if wnum then
-            dyn_rule6_weight = wnum
+            dyn_rule_weight[6] = wnum
             if PrintRule6Bar then PrintRule6Bar() end
             did = true
         end
@@ -1657,12 +1748,7 @@ function ProcessNoteCommands(noteText)
                 local valstr = lower:match("r"..tostring(i).."w%s*=?%s*([%+%-%d%.]+)")
                 local v = tonumber(valstr or "")
                 if v then
-                    if i == 1 then dyn_rule1_weight = v
-                    elseif i == 2 then dyn_rule2_weight = v
-                    elseif i == 3 then dyn_rule3_weight = v
-                    elseif i == 4 then dyn_rule4_weight = v
-                    elseif i == 5 then dyn_rule5_weight = v
-                    else dyn_rule6_weight = v end
+                    dyn_rule_weight[i] = v
                     print(string.format("Rule R%d weight set to %s", i, tostring(v)))
                     did = true
                 end
@@ -2118,19 +2204,19 @@ function NextSelectionDynamic()
   local points = {}
   local cont1, cont2, cont3, cont4, cont5, cont6 = {}, {}, {}, {}, {}, {}
   for i = 1, proteinLength do
-      local r0 = dyn_rule0_weight * norm(r0Raw[i], r0min, r0max)
-      local r1 = dyn_rule1_weight * norm(r1Raw[i], r1min, r1max)
-      local r2 = dyn_rule2_weight * norm(r2Raw[i], r2min, r2max)
-      local r3 = dyn_rule3_weight * norm(r3Raw[i], r3min, r3max)
+      local r0 = (dyn_rule_weight[0] or 0) * norm(r0Raw[i], r0min, r0max)
+      local r1 = (dyn_rule_weight[1] or 0) * norm(r1Raw[i], r1min, r1max)
+      local r2 = (dyn_rule_weight[2] or 0) * norm(r2Raw[i], r2min, r2max)
+      local r3 = (dyn_rule_weight[3] or 0) * norm(r3Raw[i], r3min, r3max)
       -- For r4/r5 lower values should get higher points → invert
       local r4 = 0
-      if sMax > sMin then r4 = dyn_rule4_weight * ((sMax - r4Raw[i]) / (sMax - sMin)) end
+      if sMax > sMin then r4 = (dyn_rule_weight[4] or 0) * ((sMax - r4Raw[i]) / (sMax - sMin)) end
       local r5 = 0
-      if bbMax > bbMin then r5 = dyn_rule5_weight * ((bbMax - r5Raw[i]) / (bbMax - bbMin)) end
+      if bbMax > bbMin then r5 = (dyn_rule_weight[5] or 0) * ((bbMax - r5Raw[i]) / (bbMax - bbMin)) end
 
       -- Rule 6: user map (normalized [0..1]) scaled by weight
       local r6 = 0
-      if rule6_mapNorm then r6 = (rule6_mapNorm[i] or 0) * (dyn_rule6_weight or 0) end
+      if rule6_mapNorm then r6 = (rule6_mapNorm[i] or 0) * (dyn_rule_weight[6] or 0) end
 
       cont1[i], cont2[i], cont3[i], cont4[i], cont5[i], cont6[i] = r1, r2, r3, r4, r5, r6
       points[i] = (r0 + r1 + r2 + r3 + r4 + r5 + r6)
@@ -2299,7 +2385,7 @@ end
 
 -- Generic bar-encoding utilities for visualizing per-segment arrays
 BAR_STYLE = { ASCII = "ascii", BASE62 = "base62", BASE10 = "base10" }
-local function getBarPalette(style)
+function getBarPalette(style)
     -- Provide BASE62 and BASE10 palettes; ASCII falls back to BASE62.
     local s
     if style == BAR_STYLE.BASE10 then
@@ -2654,13 +2740,6 @@ function roundX(x)--cut all afer 3-rd place
 return x-x%0.01
 end
 
---[[ function returning the max between two numbers --]]
-function max(num1, num2)
-   if (num1 > num2) then  result = num1
-   else result = num2    end
-   return result
-end
-
 --	BackBone-Score is just the general score without clashing. Clashing is usefull to ignore when there is need to rank a lot of the Rebuild solutions very fast without the Fuze.
 function ScoreBBReturn()
     x = 0
@@ -2829,8 +2908,6 @@ function Stats._syn_build_by_event()
   return byEvent
 end
 
--- Forward declaration so earlier functions (e.g. syn_compute_weights) can call it
-local _pearson
 
 function Stats.syn_compute_weights(limitEv)
   if not (Stats.scoreParts and #Stats.scoreParts>0) then return nil, 0, 0 end
@@ -3060,7 +3137,7 @@ function Stats.printAllMaps()
   -- 3) Rule6 user priority map (if present)
   if rule6_mapNorm and hasData(rule6_mapNorm) then
     local r6 = {}
-    for i=1,(proteinLength or 0) do r6[i] = (rule6_mapNorm[i] or 0) * (dyn_rule6_weight or 0) end
+    for i=1,(proteinLength or 0) do r6[i] = (rule6_mapNorm[i] or 0) * (dyn_rule_weight[6] or 0) end
     print("[Maps] Rule6 priority map:")
     print(encodeScalarArrayToBar(r6, pal10))
   end
@@ -3337,7 +3414,10 @@ local function _subscores_edges(startIdx, endIdx)
   if endIdx ~= startIdx then addAt(endIdx) end
   return out
 end
-_pearson = function(xs, ys)
+-- Forward declaration so earlier functions (e.g. syn_compute_weights) can call it
+--local _pearson
+
+function _pearson (xs, ys)
   local n = 0; local sx, sy, sxx, syy, sxy = 0,0,0,0,0
   local m = math.min(#xs, #ys)
   for i=1,m do
@@ -3702,7 +3782,7 @@ function Stats.printSummary()
   end
 end
 -- Analyses
-local function _event_success_map()
+function _event_success_map()
   local m = {}
   for _,r in ipairs(Stats.final) do m[r.event_ix] = r.success end
   return m
